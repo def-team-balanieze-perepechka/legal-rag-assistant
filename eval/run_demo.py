@@ -17,6 +17,7 @@ except ImportError:
     pass
 
 from assistant import Assistant, parse_dialog  # noqa: E402
+from generate import FAIL_ANSWER  # noqa: E402
 from kb import load_kb  # noqa: E402
 from llm import LLMClient, env_int  # noqa: E402
 
@@ -74,10 +75,18 @@ def main() -> None:
 
     words = [len(r["answer"].split()) for r in results.values()]
     dropped = sum(len(r.get("dropped_citations", [])) for r in results.values())
+    fails = [qid for qid, r in results.items() if r["answer"] == FAIL_ANSWER or r["status"] in ("error", "crash")]
+    no_json = [qid for qid, r in results.items() if r.get("raw_ok") is False and qid not in fails]
+    no_cites = [qid for qid, r in results.items() if r["status"] == "answer" and not r["citations"]]
+    secs = [float(r["debug"].get("seconds") or 0) for r in results.values()]
     lines = [
         "# Прогон демо-вопросов", "",
         f"- вопросов: {len(ids)}, время: {total:.1f}s, dense: {assistant.dense_ready}",
+        f"- на вопрос, с: среднее {sum(secs) / max(1, len(secs)):.1f}, максимум {max(secs, default=0):.1f}",
         f"- вызовы: {client.calls}",
+        f"- заглушка / ошибка: {len(fails)} {fails}",
+        f"- ответ без JSON (сырой текст): {len(no_json)} {no_json}",
+        f"- status=answer без цитат: {len(no_cites)} {no_cites}",
         f"- отброшено выдуманных chunk_id: {dropped}",
         f"- длина ответа, слов: среднее {sum(words) / max(1, len(words)):.0f}, максимум {max(words, default=0)}",
         f"- статусы: { {s: sum(1 for r in results.values() if r['status'] == s) for s in {r['status'] for r in results.values()}} }",
@@ -96,7 +105,7 @@ def main() -> None:
             "",
         ]
     (out / "demo_report.md").write_text("\n".join(lines), encoding="utf-8")
-    print("\n".join(lines[:7]))
+    print("\n".join(lines[:11]))
     print(f"отчёт: {out / 'demo_report.md'}")
 
 
