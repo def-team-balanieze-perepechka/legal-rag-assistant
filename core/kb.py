@@ -10,40 +10,99 @@ import json
 import re
 import sys
 import zipfile
-from dataclasses import dataclass, field
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field, asdict
 from datetime import date
 from pathlib import Path
 from typing import Iterator, Optional
-from dataclasses import dataclass, field, asdict
+
+# try:
+#     import docx as _docx
+# except Exception:
+#     _docx = None
 
 
-# Опциональный python-docx 
-try:
-    import docx as _docx 
-except Exception:  
-    _docx = None
+# ============ Константы ============
+
+# "Своя" организация. Не хардкодим по файлу: одно место — одна замена.
+SELF_ORG_NAME = "меридиан"
+
+# Порог длины единицы закона, при котором дробим её на подпункты.
+SUBCHUNK_THRESHOLD = 1200
+
+# Жёсткий лимит длины чанка.
+MAX_CHUNK_LEN = 2500
+
+# Разрешённые расширения во входном архиве/каталоге.
+ALLOWED_EXTS = {".txt", ".md", ".docx"}
 
 
-# Базовые классы
+# Латиница → кириллица для нормализации номеров договоров.
+_LAT_TO_CYR_NUM = {
+    'a': 'а', 'b': 'в', 'c': 'с', 'e': 'е', 'h': 'н',
+    'k': 'к', 'm': 'м', 'o': 'о', 'p': 'р', 't': 'т',
+    'x': 'х', 'y': 'у',
+}
+
+
+def normalize_number(s: str) -> str:
+    """Единая нормализация номера договора.
+
+    - нижний регистр;
+    - латиница → кириллица для похожих букв (a→а, p→р, t→т, ...);
+    - убираем '/', '-', '.', пробелы.
+    """
+    if not s:
+        return ""
+    s = s.lower()
+    out = []
+    for ch in s:
+        if ch in _LAT_TO_CYR_NUM:
+            out.append(_LAT_TO_CYR_NUM[ch])
+        elif ch in ' -./':
+            continue
+        else:
+            out.append(ch)
+    return ''.join(out)
+
+
+# ============ Dataclasses ============
+class ContractsDict(dict):
+    """Словарь договоров с нормализацией ключей при доступе."""
+
+    def __getitem__(self, key):
+        return super().__getitem__(normalize_number(key))
+
+    def get(self, key, default=None):
+        return super().get(normalize_number(key), default)
+
+    def __contains__(self, key):
+        return super().__contains__(normalize_number(key))
+
+    def __setitem__(self, key, value):
+        super().__setitem__(normalize_number(key), value)
+
+
 @dataclass
 class Document:
     doc_id: str
-    doc_type: str # law|contract|addendum|regulation|memo|letter|other
+    doc_type: str
     title: str
     short_ref: str
     number: Optional[str] = None
     date: Optional[date] = None
-    counterparty: Optional[dict] = None # {"name": str, "inn": str}
+    counterparty: Optional[dict] = None
     law_code: Optional[str] = None
     article: Optional[str] = None
     edition: Optional[str] = None
     valid_from: Optional[date] = None
     valid_to: Optional[date] = None
-    status: str = "active"   # active|expired
-    amends: Optional[dict] = None     # {"doc_id":..., "points":[...], "condition": str|None}
+    status: str = "active"
+    amends: Optional[dict] = None
     addenda: list[str] = field(default_factory=list)
     other_editions: list[str] = field(default_factory=list)
     source_url: Optional[str] = None
+    source_title: Optional[str] = None
     exported_at: Optional[date] = None
     text: str = ""
     filename: str = ""
@@ -87,25 +146,89 @@ class KnowledgeBase:
     chunks: list[Chunk]
     entities: Entities
     kb_hash: str
+    _chunk_by_id: dict = field(default_factory=dict, repr=False)
+    _ref_index: dict = field(default_factory=dict, repr=False)
 
     def get_document(self, doc_id: str) -> Document:
         return self.documents[doc_id]
 
     def get_chunk(self, chunk_id: str) -> Chunk:
-        for c in self.chunks:
-            if c.chunk_id == chunk_id:
-                return c
+        if chunk_id in self._chunk_by_id:
+            return self._chunk_by_id[chunk_id]
         raise KeyError(chunk_id)
 
     def find_ref(self, doc_id: str, ref: str) -> Optional[Chunk]:
-        target = _normalize_ref(ref)
-        for c in self.chunks:
-            if c.doc_id == doc_id and _normalize_ref(c.ref) == target:
-                return c
+        lst = self._ref_index.get((doc_id, _normalize_ref(ref)))
+        return lst[0] if lst else None
+
+    def find_ref_all(self, doc_id: str, ref: str) -> list[Chunk]:
+        return list(self._ref_index.get((doc_id, _normalize_ref(ref)), []))
+
+    def resolve_contract(self, text: str) -> Optional[str]:
+        if not text:
+            return None
+
+        # 1) Кандидаты: сначала номер, выуженный регуляркой из текста,
+        #    затем — весь текст целиком (для случаев, когда номер пришёл
+        #    без обвязки).
+        candidates: list[str] = []
+        m = re.search(r'[A-Za-zА-Яа-я]{1,3}\s*-?\s*\d{1,4}\s*[/-]\s*\d{2,4}', text)
+        if m:
+            candidates.append(m.group(0))
+        candidates.append(text)
+
+        # 2) Для каждого кандидата: прямое попадание, затем попытка
+        #    латинская «p» → кириллическая «п» в нормализованном номере.
+        #    Замена р→п применяется к номеру, а не ко всему вопросу.
+        for cand in candidates:
+            doc_id = self.entities.contracts.get(cand)
+            if doc_id:
+                return doc_id
+            n = normalize_number(cand)
+            if n:
+                alt = n.replace('р', 'п')
+                if alt != n:
+                    doc_id = self.entities.contracts.get(alt)
+                    if doc_id:
+                        return doc_id
         return None
 
+    
+    def match_counterparties(self, text: str) -> list[dict]:
+        if not text:
+            return []
+        lower = text.lower()
+        all_aliases: list[tuple[str, dict]] = []
+        for cp in self.entities.counterparties:
+            for alias in cp["aliases"]:
+                all_aliases.append((alias.lower(), cp))
+        all_aliases.sort(key=lambda x: -len(x[0]))
 
-# Text utilities
+        consumed = [False] * len(lower)
+        seen: set[str] = set()
+        result: list[dict] = []
+        for alias, cp in all_aliases:
+            start = 0
+            while True:
+                idx = lower.find(alias, start)
+                if idx < 0:
+                    break
+                end = idx + len(alias)
+                left_ok = idx == 0 or not lower[idx - 1].isalnum()
+                right_ok = end == len(lower) or not lower[end].isalnum()
+                if left_ok and right_ok and not any(consumed[idx:end]):
+                    if cp["name"] not in seen:
+                        seen.add(cp["name"])
+                        result.append(cp)
+                    for k in range(idx, end):
+                        consumed[k] = True
+                    break
+                start = idx + 1
+        return result
+
+
+# ============ Text utilities ============
+
 _WS_RE = re.compile(r"[ \t\u00A0\u202F]+")
 
 _TRANSLIT = {
@@ -119,19 +242,18 @@ _TRANSLIT = {
 _MONTHS = {
     'января': 1, 'февраля': 2, 'марта': 3, 'апреля': 4, 'мая': 5, 'июня': 6,
     'июля': 7, 'августа': 8, 'сентября': 9, 'октября': 10, 'ноября': 11,
-    'декабря': 12
+    'декабря': 12,
 }
 
 
 def normalize_text(s: str) -> str:
-    """Нормализуем переводы строк и NBSP, но не трогаем буквы."""
     if not s:
         return ""
     if s.startswith("\ufeff"):
         s = s[1:]
     s = s.replace("\r\n", "\n").replace("\r", "\n")
     s = s.replace("\u00A0", " ").replace("\u202F", " ")
-    lines = [_WS_RE.sub(" ", ln).rstrip() for ln in s.split("\n")]
+    lines = [_WS_RE.sub(" ", ln).lstrip().rstrip() for ln in s.split("\n")]
     while lines and not lines[0]:
         lines.pop(0)
     while lines and not lines[-1]:
@@ -152,20 +274,16 @@ def slugify(s: str) -> str:
     return re.sub(r'-+', '-', ''.join(out)).strip('-')
 
 
-
-
 def parse_russian_date(s: str) -> Optional[date]:
     if not s:
         return None
     s = s.strip().lower()
-    # "1 августа 2024 г." / "1 августа 2024"
     m = re.search(r'(\d{1,2})\s+([а-яё]+)\s+(\d{4})', s)
     if m and m.group(2) in _MONTHS:
         try:
             return date(int(m.group(3)), _MONTHS[m.group(2)], int(m.group(1)))
         except ValueError:
             return None
-    # "12.05.2025"
     m = re.search(r'(\d{2})\.(\d{2})\.(\d{4})', s)
     if m:
         try:
@@ -180,49 +298,76 @@ def _normalize_ref(ref: str) -> str:
     r = re.sub(r'^пункт\s+', 'п. ', r)
     r = re.sub(r'^часть\s+', 'ч. ', r)
     r = re.sub(r'^подпункт\s+', 'пп. ', r)
-    # "ч.4" → "ч. 4", но "3.1" не трогаем
+    r = re.sub(r'^примечание\s+', 'прим. ', r)
     r = re.sub(r'([а-яa-z]+\.)\s*(\d)', r'\1 \2', r)
     r = re.sub(r'\s+', ' ', r).strip()
     return r
 
-
 def _strip_leading_number(text: str) -> str:
-    """Убираем '3.1. ' / '2) ' / '1. ' в начале — чтобы не дублировать номер в text_for_index."""
+    # Дефисные номера ("1.7-1.", "2.8-1)") не срезаем: они уже есть в ref,
+    # а частичная обрезка ("1." → оставляет "7-1.") ломает text_for_index.
+    # Оставляем полный токен — BM25/эмбеддинги это переживут.
+    if re.match(r'^\d+(?:\.\d+)*-\d+[\.\)]', text):
+        return text
     return re.sub(r'^\d+(?:\.\d+)*[\.\)]\s*', '', text, count=1)
 
+# ============ Rules: чистка законов от пометок Гаранта ============
 
-
-# Rules: чистка законов от пометок Гаранта
 GARANT_HEADER_RE = [
     re.compile(r'^Источник:\s*(.+)$', re.MULTILINE),
     re.compile(r'^URL:\s*(\S+)$', re.MULTILINE),
     re.compile(r'^Дата выгрузки:\s*(.+)$', re.MULTILINE),
 ]
 
-GARANT_HISTORY_LINE_RE = re.compile(
-    r'^\s*('
-    r'(?:Статья|Пункт|Подпункт|Часть|Абзац|Положени\w+)\s+'
-    r'(?:[\d\.]+\s+)?'
-    r'(?:изменен[аоы]?|дополнен[аоы]?|утратил[аи]?\s+силу|исключен[аоы]?)'
-    r'(?:\s+с\s+[\d\.]+\s*(?:г\.|года)?)?'
-    r'.*'
-    r'|Федеральн(?:ым|ыми|ый|ые)\s+закон\w*\s+от\s+.*'
-    r'|См\.\s+текст\s+.*'
-    r'|Информация\s+об\s+изменениях.*'
-    r'|О\s+проверке\s+конституционности.*'
-    r'|О\s+[^\n]{5,300}?\sсм\.\s+(?:постановлени|определени|письм|разъяснени)\w*.*'
-    r')\s*$',
-    re.MULTILINE,
-)
-# Нормы, а не пометки
+# GARANT_HISTORY_LINE_RE = re.compile(
+#     r'^\s*('
+#     r'(?:Статья|Пункт|Подпункт|Часть|Абзац|Положени\w+)\s+'
+#     r'(?:[\d\.]+\s+)?'
+#     r'(?:изменен[аоы]?|дополнен[аоы]?|утратил[аи]?\s+силу|исключен[аоы]?)'
+#     r'(?:\s+с\s+[\d\.]+\s*(?:г\.|года)?)?'
+#     r'.*'
+#     r'|Федеральн(?:ым|ыми|ый|ые)\s+закон\w*\s+от\s+.*'
+#     r'|См\.\s+текст\s+.*'
+#     r'|Информация\s+об\s+изменениях.*'
+#     r'|О\s+проверке\s+конституционности.*'
+#     r'|О\s+[^\n]{5,300}?\sсм\.\s+(?:постановлени|определени|письм|разъяснени)\w*.*'
+#     # Строка «Cрок давности …» с латинской C (навигация Гаранта)
+#     r'|\u0043рок\s+давност[ьи]\s+привлечения.*'
+#     r')\s*$',
+#     re.MULTILINE | re.IGNORECASE,
+# )
+
 GARANT_KEEP_RE = re.compile(
     r'Положения\s+настоящего\s+(?:подпункта|пункта|абзаца)'
     r'|^\s*\d+\)\s+утратил\s+силу',
 )
 
+GARANT_HISTORY_RES = [
+    re.compile(
+        r'^\s*(?:Статья|Пункт|Подпункт|Часть|Абзац|Положени\w+|Примечани[еяй])\s+'
+        r'(?:[\d\.\-]+\s+)?'
+        r'(?:изменен[аоы]?|дополнен[аоы]?|утратил[аи]?\s+силу|исключен[аоы]?)'
+        r'(?:\s+с\s+[\d\.]+\s*(?:г\.|года)?)?'
+        r'.*$',
+        re.MULTILINE | re.IGNORECASE,
+    ),
+    re.compile(r'^\s*Федеральн(?:ым|ыми|ый|ые)\s+закон\w*\s+от\s+.*$', re.MULTILINE | re.IGNORECASE),
+    re.compile(r'^\s*См\.\s+текст\s+.*$', re.MULTILINE | re.IGNORECASE),
+    re.compile(r'^\s*Информация\s+об\s+изменениях.*$', re.MULTILINE | re.IGNORECASE),
+    re.compile(r'^\s*О\s+проверке\s+конституционности.*$', re.MULTILINE | re.IGNORECASE),
+    re.compile(
+        r'^\s*О\s+[^\n]{5,300}?\sсм\.\s+(?:постановлени|определени|письм|разъяснени)\w*.*$',
+        re.MULTILINE | re.IGNORECASE,
+    ),
+    re.compile(
+        r'^\s*Обратите\s+внимание\b.*$',
+        re.MULTILINE | re.IGNORECASE,
+    ),
+    re.compile(r'^\s*\u0043рок\s+давност[ьи]\s+привлечения.*$', re.MULTILINE | re.IGNORECASE),
+]
+
 
 def clean_law_text(raw: str) -> tuple[str, dict]:
-    """Возвращает (очищенный текст, шапка)."""
     header: dict = {}
 
     m = GARANT_HEADER_RE[0].search(raw)
@@ -242,11 +387,10 @@ def clean_law_text(raw: str) -> tuple[str, dict]:
     for line in raw.split('\n'):
         if any(r.search(line) for r in GARANT_HEADER_RE):
             continue
-        if GARANT_HISTORY_LINE_RE.match(line) and not GARANT_KEEP_RE.search(line):
+        if any(r.search(line) for r in GARANT_HISTORY_RES) and not GARANT_KEEP_RE.search(line):
             continue
         cleaned_lines.append(line)
 
-    # Схлопываем лишние пустые строки
     out: list[str] = []
     blank = 0
     for ln in cleaned_lines:
@@ -266,29 +410,70 @@ def clean_law_text(raw: str) -> tuple[str, dict]:
     return "\n".join(out), header
 
 
+# ============ Чтение архива ============
 
-# Чтение архива
 def _decode(filename: str, raw: bytes) -> str:
     name = filename.lower()
     if name.endswith(".docx"):
         return _read_docx(raw)
-    # txt / md — декодируем utf-8-sig
-    return raw.decode("utf-8-sig", errors="replace")
 
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        pass
+    try:
+        text = raw.decode("cp1251")
+        print(f"[kb] WARN: {filename} decoded as cp1251", file=sys.stderr)
+        return text
+    except UnicodeDecodeError:
+        print(f"[kb] WARN: {filename} decoded with errors=replace", file=sys.stderr)
+        return raw.decode("utf-8-sig", errors="replace")
+
+
+_W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+
+
+# def _read_docx(raw: bytes) -> str:
+#     # Если python-docx не справился (неполный OPC-архив, битый файл и т.п.),
+#     # откатываемся на ET, а не роняем разбор всего документа.
+#     if _docx is not None:
+#         try:
+#             doc = _docx.Document(io.BytesIO(raw))
+#             return "\n".join(p.text for p in doc.paragraphs)
+#         except Exception as e:
+#             print(
+#                 f"[kb] WARN: python-docx не смог разобрать DOCX ({e}); "
+#                 f"fallback на ElementTree",
+#                 file=sys.stderr,
+#             )
+#             # не return — уходим в ET-ветку ниже
+
+#     # Fallback через ElementTree — корректно раскодирует все XML-сущности,
+#     # включая числовые (&#171; → «, &#187; → »).
+#     with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+#         xml_bytes = zf.read("word/document.xml")
+#     try:
+#         root = ET.fromstring(xml_bytes)
+#     except ET.ParseError:
+#         return ""
+#     paragraphs: list[str] = []
+#     for p in root.iter(_W_NS + 'p'):
+#         parts = [t.text or "" for t in p.iter(_W_NS + 't')]
+#         paragraphs.append("".join(parts))
+#     return "\n".join(paragraphs)
 
 def _read_docx(raw: bytes) -> str:
-    if _docx is not None:
-        doc = _docx.Document(io.BytesIO(raw))
-        return "\n".join(p.text for p in doc.paragraphs)
-    # Fallback: читаем word/document.xml напрямую
     with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-        xml = zf.read("word/document.xml").decode("utf-8", errors="replace")
-    xml = re.sub(r'</w:p>', '\n', xml)
-    xml = re.sub(r'<[^>]+>', '', xml)
-    # Простейший unescape
-    for a, b in (("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'), ("&apos;", "'")):
-        xml = xml.replace(a, b)
-    return xml
+        xml_bytes = zf.read("word/document.xml")
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return ""
+    paragraphs: list[str] = []
+    for p in root.iter(_W_NS + 'p'):
+        parts = [t.text or "" for t in p.iter(_W_NS + 't')]
+        paragraphs.append("".join(parts))
+    return "\n".join(paragraphs)
 
 
 def _iter_archive(path: Path) -> Iterator[tuple[str, bytes]]:
@@ -301,53 +486,85 @@ def _iter_archive(path: Path) -> Iterator[tuple[str, bytes]]:
                 continue
             if info.file_size == 0:
                 continue
+            ext = Path(name).suffix.lower()
+            if ext not in ALLOWED_EXTS:
+                print(f"[kb] WARN: skip non-document {name}", file=sys.stderr)
+                continue
             yield name, zf.read(info)
 
 
 def _iter_dir(path: Path) -> Iterator[tuple[str, bytes]]:
     for f in path.iterdir():
-        if f.is_file() and f.suffix.lower() in {".txt", ".md", ".docx"}:
+        if f.is_file() and f.suffix.lower() in ALLOWED_EXTS:
             yield f.name, f.read_bytes()
 
 
+# ============ Классификация документа ============
 
-# Классификация документа
+def _first_significant_lines(text: str, n: int = 5) -> list[str]:
+    """Первые n непустых строк, пропуская статусные строки «РЕДАКЦИЯ УТРАТИЛА СИЛУ…»."""
+    result: list[str] = []
+    for line in text.split('\n'):
+        s = line.strip()
+        if not s:
+            continue
+        if re.match(r'^РЕДАКЦИЯ\s+УТРАТИЛА\s+СИЛУ', s, re.IGNORECASE):
+            continue
+        result.append(s)
+        if len(result) >= n:
+            break
+    return result
+
+
 def extract_doc_type(filename: str, text: str) -> str:
     fn = filename.lower()
-    head = text[:800].lower()
-    body2k = text[:2000].lower()
 
-    # Законы
-    if re.search(r'^Источник:', text[:500], re.MULTILINE) \
-       or re.search(r'^URL:\s*https?://', text[:500], re.MULTILINE | re.IGNORECASE) \
-       or "__законы__" in fn or fn.startswith("законы__") or "/законы__" in fn:
+    # Законы — по уникальным маркерам
+    if (re.search(r'^Источник:', text[:500], re.MULTILINE)
+            or re.search(r'^URL:\s*https?://', text[:500], re.MULTILINE | re.IGNORECASE)
+            or "__законы__" in fn or fn.startswith("законы__") or "/законы__" in fn):
         return "law"
     if re.search(r'^Статья\s+\d+(?:\.\d+)?\.', text[:3000], re.MULTILINE):
         return "law"
 
-    # Письмо/записка — по filename и по НАЧАЛУ строки, не по вхождению слова в тело.
-    # Письмо может цитировать регламент — поэтому идёт раньше regulation.
-    if "письмо" in fn \
-       or re.search(r'^\s*письмо\b', text[:400], re.IGNORECASE) \
-       or re.search(r'^\s*исх\.\s*№', text[:500], re.MULTILINE | re.IGNORECASE):
+    # Тип — по первой значимой строке. Проверяем строки в порядке
+    # следования: как только строка подошла под анкоренный шаблон — это тип.
+    # Так договор, упоминающий «дополнительное соглашение» в преамбуле,
+    # остаётся договором (первая строка «ДОГОВОР…» выигрывает).
+    sig_lines = _first_significant_lines(text, 5)
+
+    patterns = [
+        ("letter",     re.compile(r'^\s*(?:письмо\b|исх\.\s*№)', re.IGNORECASE)),
+        ("memo",       re.compile(r'^\s*служебная\s+записка\b', re.IGNORECASE)),
+        ("addendum",   re.compile(r'^\s*(?:дополнительное|доп\.)\s+соглашение\b', re.IGNORECASE)),
+        ("regulation", re.compile(r'^\s*регламент\b', re.IGNORECASE)),
+        ("contract",   re.compile(r'^\s*договор\b', re.IGNORECASE)),
+    ]
+    for line in sig_lines:
+        for doc_type, pat in patterns:
+            if pat.search(line):
+                return doc_type
+
+    # Fallback по имени файла — только когда текст ничего не дал
+    if "письмо" in fn:
         return "letter"
-    if "служебная записка" in fn or "служебная записка" in head:
+    if "служебная записка" in fn:
         return "memo"
-    if ("дополнительное соглашение" in fn or "доп. соглашение" in fn
-        or "дополнительное соглашение" in head or "доп. соглашение" in head):
+    if "дополнительное соглашение" in fn or "доп. соглашение" in fn or "доп соглашение" in fn:
         return "addendum"
-    # Регламент — только filename или заголовок-первая-строка, не «упоминание»
-    if "регламент" in fn or re.search(r'^\s*регламент\b', text[:400], re.IGNORECASE):
+    if "регламент" in fn:
         return "regulation"
-    if re.search(r'^\s*договор\b', text[:300], re.IGNORECASE) or "договор" in fn:
+    if "договор" in fn:
         return "contract"
 
     return "other"
 
+# ============ Извлечение метаданных ============
 
-
-# Извлечение метаданных
-_ORG_RE = re.compile(r'(ООО|АО|ПАО|ЗАО|ИП)\s*[«"]([^»"]+)[»"]\s*\(?ИНН\s*(\d{9,12})', re.IGNORECASE)
+_ORG_RE = re.compile(
+    r'(ООО|АО|ПАО|ЗАО|ИП)\s*[«"]([^»"]+)[»"]\s*\(?ИНН\s*(\d{9,12})',
+    re.IGNORECASE,
+)
 _INN_RE = re.compile(r'ИНН\s*(\d{9,12})')
 _NUMBER_RE = re.compile(r'№\s*([А-ЯA-Z0-9\-/]+)', re.IGNORECASE)
 
@@ -355,19 +572,50 @@ _NUMBER_RE = re.compile(r'№\s*([А-ЯA-Z0-9\-/]+)', re.IGNORECASE)
 def extract_counterparty(text: str, doc_type: str) -> Optional[dict]:
     if doc_type not in ("contract", "addendum"):
         return None
-    # Ищем все организации в шапке; берём ту, что не «Меридиан»
+
     head = text[:1500]
-    candidates = []
+    candidates: list[dict] = []
     for m in _ORG_RE.finditer(head):
         name = f"{m.group(1)} «{m.group(2)}»"
         candidates.append({"name": name, "inn": m.group(3)})
+
+    # Без ИНН сразу после названия: «ООО «X» («Поставщик»)» / «ООО «X», именуемое…»
+    for m in re.finditer(
+        r'(ООО|АО|ПАО|ЗАО|ИП)\s*[«"]([^»"]+)[»"]\s*(?:\([^)]*\)|,)?',
+        head,
+        re.IGNORECASE,
+    ):
+        name = f"{m.group(1)} «{m.group(2)}»"
+        if not any(c["name"] == name for c in candidates):
+            candidates.append({"name": name, "inn": None})
+
+    if not candidates:
+        print(f"[kb] WARN: no counterparty in contract preamble", file=sys.stderr)
+        return None
+
     for c in candidates:
-        if "меридиан" not in c["name"].lower():
+        if SELF_ORG_NAME not in c["name"].lower():
             return c
-    return candidates[0] if candidates else None
+
+    # Все найденные — наша организация; контрагента нет
+    print(f"[kb] WARN: only self org in contract preamble", file=sys.stderr)
+    return None
 
 
 def extract_number(text: str, doc_type: str) -> Optional[str]:
+    if doc_type == "law":
+        return None
+
+    if doc_type == "regulation":
+        # Ищем номер собственного приказа, а не того, что отменил редакцию
+        m = re.search(
+            r'Утверждён\w*\s+(?:приказом|распоряжением)\b[^№\n]*№\s*([А-ЯA-Z0-9\-/]+)',
+            text[:1500],
+            re.IGNORECASE,
+        )
+        if m:
+            return m.group(1).strip()
+
     head = text[:800]
     m = _NUMBER_RE.search(head)
     if m:
@@ -380,15 +628,60 @@ def extract_title(filename: str, text: str, doc_type: str) -> str:
         m = re.search(r'^Статья\s+[\d\.]+\..*$', text, re.MULTILINE)
         if m:
             return m.group(0).strip()
+        return filename
 
     if doc_type == "regulation":
-        # Первая строка может быть «РЕДАКЦИЯ УТРАТИЛА СИЛУ …» — берём из имени
+        for line in text.split('\n'):
+            s = line.strip()
+            if not s:
+                continue
+            if re.match(r'^РЕДАКЦИЯ\s+УТРАТИЛА\s+СИЛУ', s, re.IGNORECASE):
+                continue
+            if re.match(r'^(ООО|АО|ПАО|ЗАО)\b', s):
+                continue
+            if re.match(r'^Утвержд', s, re.IGNORECASE):
+                continue
+            if 'регламент' in s.lower():
+                # Убираем «(утратил силу)» и подобное
+                s = re.sub(r'\s*[\(\[]\s*утратил\w*\s+силу\s*[\)\]]?', '', s, flags=re.IGNORECASE)
+                return s.strip()
         base = filename.split("__", 1)[-1]
         base = re.sub(r'\.(txt|md|docx)$', '', base, flags=re.IGNORECASE)
-        base = re.sub(r'[\s_,]*[\(\[]?\s*ред\.?\s*\d{4}\s*[\)\]]?',
-                      '', base, flags=re.IGNORECASE).strip(" _,")
-        if base:
-            return base
+        base = re.sub(r'[\s_,]*[\(\[]?\s*ред\.?\s*\d{4}\s*[\)\]]?', '', base, flags=re.IGNORECASE).strip(" _,")
+        return base or filename
+
+    if doc_type == "contract":
+        first = text.split("\n", 1)[0].strip() if text else ""
+        if first:
+            head_part, sep, tail = first.partition("№")
+            hp = head_part.strip()
+            if hp and (hp.isupper() or hp[:1].isupper()):
+                hp = hp.lower().capitalize()
+            if sep:
+                return f"{hp} №{tail}"
+            return hp or first
+
+    if doc_type in ("memo", "letter"):
+        # §3.3: title — тема документа («О …» / «Об …», «Служебная записка …»,
+        # «Письмо …»), а не «Исх. № …» и не «ООО «…»».
+        # Два прохода: сначала тематические строки, потом «Исх. № …» как фолбэк.
+        for line in text.split('\n'):
+            s = line.strip()
+            if not s:
+                continue
+            if re.match(r'^(ООО|АО|ПАО|ЗАО)\b', s):
+                continue
+            if s.lower().startswith(('о ', 'об ')):
+                return s
+            if 'служебная записка' in s.lower() or s.lower().startswith('письмо'):
+                return s
+        for line in text.split('\n'):
+            s = line.strip()
+            if re.match(r'^Исх\.\s*№', s, re.IGNORECASE):
+                return s
+        first = text.split("\n", 1)[0].strip() if text else ""
+        if first:
+            return first
 
     first = text.split("\n", 1)[0].strip() if text else ""
     if first:
@@ -396,11 +689,13 @@ def extract_title(filename: str, text: str, doc_type: str) -> str:
     base = filename.split("__", 1)[-1]
     return base.rsplit(".", 1)[0]
 
+
 _LAW_CODES = [
-    (r'(?<![а-яё])(?:нк|налогов\w+\s+кодекс)\b',        "НК РФ"),
-    (r'(?<![а-яё])(?:тк|трудов\w+\s+кодекс)\b',         "ТК РФ"),
+    (r'(?<![а-яё])(?:нк|налогов\w+\s+кодекс)\b', "НК РФ"),
+    (r'(?<![а-яё])(?:тк|трудов\w+\s+кодекс)\b', "ТК РФ"),
     (r'(?<![а-яё])(?:коап|кодекс\s+об\s+административн\w+)\b', "КоАП РФ"),
 ]
+
 
 def _detect_law_code(src: str, allow_fz: bool = True) -> Optional[str]:
     s = src.lower()
@@ -413,7 +708,11 @@ def _detect_law_code(src: str, allow_fz: bool = True) -> Optional[str]:
             return f"{m.group(1)}-ФЗ"
     if "мрот" in s:
         return "Закон о МРОТ"
+    m = re.search(r'\b([А-ЯЁ]{2,6})\s+РФ\b', src)
+    if m:
+        return f"{m.group(1)} РФ"
     return None
+
 
 def extract_law_code_and_article(filename: str, text: str,
                                  source: Optional[str] = None
@@ -421,7 +720,6 @@ def extract_law_code_and_article(filename: str, text: str,
     art_pat = re.compile(r'(?:ст\.?\s*|Статья\s+)(\d+(?:\.\d+)?)')
     body_art = re.search(r'^Статья\s+(\d+(?:\.\d+)?)\.', text, re.MULTILINE)
 
-    # 1) имя файла, 2) строка «Источник:» из шапки Гаранта (она вырезана из text!)
     for src in (filename, source):
         if not src:
             continue
@@ -430,7 +728,6 @@ def extract_law_code_and_article(filename: str, text: str,
             am = art_pat.search(src) or body_art
             return code, (am.group(1) if am else None)
 
-    # 3) тело: только кодексы, без NN-ФЗ — там это ссылки на изменяющие законы
     code = _detect_law_code(text[:3000], allow_fz=False)
     am = body_art or art_pat.search(text[:3000])
     return code, (am.group(1) if am else None)
@@ -443,11 +740,13 @@ def extract_edition(text: str) -> Optional[str]:
     return f"от {m.group(1)}" if m else None
 
 
-def extract_validity(text: str) -> tuple[Optional[date], Optional[date], str]:
+def extract_validity(text: str, doc_type: str = "other"
+                     ) -> tuple[Optional[date], Optional[date], str]:
     vf = vt = None
     status = "active"
 
-    m = re.search(r'Действует\s+с\s+(\d{2}\.\d{2}\.\d{4}|\d{1,2}\s+[а-яё]+\s+\d{4})', text)
+    m = re.search(r'Действует\s+с\s+(\d{2}\.\d{2}\.\d{4}|\d{1,2}\s+[а-яё]+\s+\d{4})',
+                  text, re.IGNORECASE)
     if m:
         vf = parse_russian_date(m.group(1))
 
@@ -458,17 +757,25 @@ def extract_validity(text: str) -> tuple[Optional[date], Optional[date], str]:
         if vt:
             status = "expired"
 
-    # valid_from для редакций — из «Редакция от …», независимо от vt
     if vf is None:
         m = re.search(r'Редакция\s+от\s+(\d{2}\.\d{2}\.\d{4}|\d{1,2}\s+[а-яё]+\s+\d{4})', text)
         if m:
             vf = parse_russian_date(m.group(1))
 
+    # NEW: письма вида «С 21 апреля 2025 г. до подписания …»
+    if vf is None and doc_type == "letter":
+        m = re.search(
+            r'^\s*[Сс]\s+(\d{1,2}\s+[а-яё]+\s+\d{4})\s+г?\.?\s+'
+            r'(?:до\s+подписания|вступает\s+в\s+силу|применяется)',
+            text[:1500],
+            re.MULTILINE | re.IGNORECASE,
+        )
+        if m:
+            vf = parse_russian_date(m.group(1))
+
     return vf, vt, status
 
-
 def extract_amends(text: str) -> Optional[dict]:
-    """Для допсоглашений: parent_number, points, condition (без doc_id — разрешим позже)."""
     head = text[:1500]
     parent_number = None
     m = re.search(r'СОГЛАШЕНИЕ\s+№\s*(\S+)\s+к\s+договору\s+[^№]*№\s*(\S+)',
@@ -490,9 +797,13 @@ def extract_amends(text: str) -> Optional[dict]:
             points.append(pm.group(1))
 
     condition = None
-    cm = re.search(r'Условие\s+применения[:\s]*[«"]?(.+?)[»"]?(?:\.\s|\.$|$)', text, re.IGNORECASE | re.DOTALL)
+    cm = re.search(r'Условие\s+применения[:\s]*[«"]?(.+?)[»"]?(?:\.\s|\.$|$)', text,
+                   re.IGNORECASE | re.DOTALL)
     if cm:
         condition = cm.group(1).strip()
+        tail = text[cm.end(1):cm.end(1) + 3]
+        if re.match(r'[»"]?\s*\.', tail) and not condition.endswith('.'):
+            condition += '.'
     else:
         cm = re.search(r'применя\w*\s+(к\s+.+?)(?:\.\s|\.$)', text, re.IGNORECASE)
         if cm:
@@ -504,10 +815,10 @@ def extract_amends(text: str) -> Optional[dict]:
 def build_doc_id(doc_type, filename, title, number, law_code, article,
                  edition, parent_number: Optional[str] = None) -> str:
     if doc_type == "law" and law_code and article:
-        code_key = slugify(law_code)              # nk-rf, tk-rf, koap-rf, 152-fz, zakon-o-mrot
+        code_key = slugify(law_code)
         code_key = code_key.replace('-rf', '').replace('-fz', 'fz')
         if code_key.startswith("zakon-o-"):
-            code_key = code_key[len("zakon-o-"):]  # mrot
+            code_key = code_key[len("zakon-o-"):]
         return f"{code_key}_{article.replace('.', '-')}"
 
     if doc_type == "contract" and number:
@@ -539,7 +850,9 @@ def build_doc_id(doc_type, filename, title, number, law_code, article,
 
     return f"{doc_type}_{slugify(title)[:40] or 'doc'}"
 
-# Парсинг одного документа
+
+# ============ Парсинг одного документа ============
+
 def parse_document(filename: str, raw_text: str) -> Document:
     raw = normalize_text(raw_text)
     doc_type = extract_doc_type(filename, raw)
@@ -554,13 +867,21 @@ def parse_document(filename: str, raw_text: str) -> Document:
     law_code, article = (
         extract_law_code_and_article(filename, cleaned, header.get("source"))
         if doc_type == "law" else (None, None)
-    )   
+    )
+
     edition = extract_edition(cleaned)
-    valid_from, valid_to, status = extract_validity(cleaned)
+    if doc_type == "law":
+        edition = "действующая"
+
+    if doc_type == "law":
+        valid_from, valid_to, status = None, None, "active"
+    else:
+        valid_from, valid_to, status = extract_validity(cleaned, doc_type)
+
     counterparty = extract_counterparty(cleaned, doc_type)
 
     doc_date = None
-    if doc_type == "contract":
+    if doc_type in ("contract", "addendum"):
         head = cleaned[:500]
         dm = re.search(r'[—\-–]\s*([\d]{1,2}\s+[а-яё]+\s+\d{4})', head, re.IGNORECASE)
         if dm:
@@ -569,17 +890,14 @@ def parse_document(filename: str, raw_text: str) -> Document:
             dm = re.search(r'от\s+([\d]{2}\.[\d]{2}\.[\d]{4})', head)
             if dm:
                 doc_date = parse_russian_date(dm.group(1))
-    if doc_type == "memo" or doc_type == "letter":
+    if doc_type in ("memo", "letter"):
         dm = re.search(r'от\s+([\d]{2}\.[\d]{2}\.[\d]{4})', cleaned[:300])
         if dm:
             doc_date = parse_russian_date(dm.group(1))
 
     if doc_type == "contract" and valid_from is None:
         valid_from = doc_date
-    if doc_type == "law":
-        valid_from = valid_from  # закон — действующая редакция; valid_from не критичен
 
-     # допсоглашения: сначала parent_number, потом doc_id 
     amends = None
     parent_number = None
     if doc_type == "addendum":
@@ -590,14 +908,21 @@ def parse_document(filename: str, raw_text: str) -> Document:
                 "points": parsed.get("points", []),
                 "condition": parsed.get("condition"),
             }
-            # "doc_id" здесь не заполняем — его разрешит _link_addenda
 
     short_ref = _make_short_ref(doc_type, title, number, counterparty,
-                                law_code, article, edition)
-
+                                law_code, article, edition, parent_number)
     doc_id = build_doc_id(doc_type, filename, title, number,
                           law_code, article, edition,
                           parent_number=parent_number)
+
+    if doc_type in ("contract", "addendum") and valid_to is None:
+        m = re.search(
+            r'действует\s+до\s+(\d{1,2}\s+[а-яё]+\s+\d{4}|\d{2}\.\d{2}\.\d{4})',
+            cleaned, re.IGNORECASE,
+        )
+        if m:
+            valid_to = parse_russian_date(m.group(1))
+
     return Document(
         doc_id=doc_id,
         doc_type=doc_type,
@@ -614,13 +939,15 @@ def parse_document(filename: str, raw_text: str) -> Document:
         status=status,
         amends=amends,
         source_url=header.get("source_url"),
+        source_title=header.get("source"),
         exported_at=header.get("exported_at"),
         text=cleaned,
         filename=filename,
     )
 
 
-def _make_short_ref(doc_type, title, number, counterparty, law_code, article, edition) -> str:
+def _make_short_ref(doc_type, title, number, counterparty, law_code, article,
+                    edition, parent_number: Optional[str] = None) -> str:
     if doc_type == "law" and law_code and article:
         return f"{law_code}, ст. {article}"
     if doc_type == "contract" and number:
@@ -629,6 +956,8 @@ def _make_short_ref(doc_type, title, number, counterparty, law_code, article, ed
         kind = " ".join(words[:2]).lower() if len(words) >= 2 else kind_part.lower()
         return f"{kind} № {number}"
     if doc_type == "addendum" and number:
+        if parent_number:
+            return f"доп. соглашение № {number} к договору № {parent_number}"
         return f"доп. соглашение № {number}"
     if doc_type == "memo" and number:
         return f"служебная записка № {number}"
@@ -639,12 +968,13 @@ def _make_short_ref(doc_type, title, number, counterparty, law_code, article, ed
         return f"{base}, редакция {edition}" if edition else base
     return title[:80]
 
-# Chunking
+
+# ============ Chunking ============
+
 _BLANK_LINE_RE = re.compile(r"\n\s*\n")
 
 
 def iter_paragraphs(text: str) -> Iterator[tuple[str, int, int]]:
-    """Разбиение на абзацы по пустым строкам, с точными (start, end)."""
     pos, n = 0, len(text)
     while pos < n:
         m = _BLANK_LINE_RE.search(text, pos)
@@ -674,29 +1004,32 @@ def _doc_prefix_for_index(doc: Document) -> str:
     base = doc.short_ref
     if doc.doc_type == "contract" and doc.counterparty:
         base = f"{base} с {doc.counterparty['name']}"
+    if base and base[0].islower():
+        base = base[0].upper() + base[1:]
     return f"{base} ({_status_display(doc)})."
-
 
 def _ref_for_index(ref: str) -> str:
     if not ref:
         return ref
-    if ref[0].islower() and not ref.startswith(("п.", "ч.", "пп.")):
+    if ref[0].islower() and not ref.startswith(("п.", "ч.", "пп.", "прим.")):
         return ref[0].upper() + ref[1:]
     return ref
 
 
 def _build_text_for_index(doc: Document, ref: str, section: Optional[str], content: str) -> str:
     parts = [_doc_prefix_for_index(doc)]
-    if section:
+    if section and not ref.startswith("раздел"):
         parts.append(f"Раздел {section}.")
     parts.append(_ref_for_index(ref) + ".")
     parts.append(content)
     return " ".join(parts)
 
 _REPEALED_RE = re.compile(
-    r'^\W*(?:\d+(?:\.\d+)?[.)]\s*)?'
-    r'(?:(?:Часть|Пункт|Подпункт|Абзац)\s+[\w.]+\s+)?утратил[аи]?\s+силу',
-    re.IGNORECASE)
+    r'^\W*(?:\d+(?:\.\d+)*(?:-\d+)?[.)]\s*)?'
+    r'(?:(?:Часть|Пункт|Подпункт|Абзац)\s+[\w.\-]+\s+)?утратил[аи]?\s+силу',
+    re.IGNORECASE,
+)
+
 
 def _make_chunk(doc: Document, slug: str, ref: str, section: Optional[str],
                 text: str, start: int, end: int) -> Chunk:
@@ -720,8 +1053,9 @@ def _make_chunk(doc: Document, slug: str, ref: str, section: Optional[str],
 
 
 _SUSPICIOUS_RE = re.compile(
-    r'(игнорируй|забудь\s+(?:все\s+)?инструкции|для\s+ии[- ]?ассистента|'
-    r'system\s*prompt|отвечай\s+только|как\s+ии\b)',
+    r'(игнорируй|забудь\s+(?:все\s+)?инструкции|для\s+ии\b|'
+    r'system\s*prompt|отвечай\s+(?:только|всегда)|как\s+ии\b|'
+    r'ты\s*[-—]\s*ассистент|ignore\s+(?:all\s+)?previous\s+instructions)',
     re.IGNORECASE,
 )
 
@@ -730,7 +1064,7 @@ def _is_suspicious(text: str) -> bool:
     return bool(_SUSPICIOUS_RE.search(text))
 
 
-# Договоры и регламенты
+# --- Договоры и регламенты ---
 
 _SECTION_RE = re.compile(r'^(\d+)\.\s+([А-ЯЁA-Z][^\n]*)$', re.MULTILINE)
 _POINT_RE = re.compile(r'^(\d+\.\d+)\.\s+', re.MULTILINE)
@@ -763,7 +1097,6 @@ def _chunk_contract_like(doc: Document) -> list[Chunk]:
         kind, pos, sec_num, sec_title, point_num = markers[i]
         if kind == "section":
             current_section = f"{sec_num}. {sec_title}"
-            # Есть ли внутри этой секции пункты?
             has_points = False
             for j in range(i + 1, len(markers)):
                 if markers[j][0] == "section":
@@ -779,7 +1112,7 @@ def _chunk_contract_like(doc: Document) -> list[Chunk]:
                 slug = "requisites" if "реквизит" in current_section.lower() else f"s{sec_num}"
                 ref = f"раздел {sec_num} (реквизиты)" if slug == "requisites" else f"раздел {sec_num}"
                 chunks.append(_make_chunk(doc, slug, ref, current_section, text[s:e], s, e))
-        else:  # point
+        else:
             next_pos = markers[i + 1][1] if i + 1 < len(markers) else len(text)
             s, e = pos, next_pos
             while e > s and text[e - 1] in " \n":
@@ -789,48 +1122,53 @@ def _chunk_contract_like(doc: Document) -> list[Chunk]:
             chunks.append(_make_chunk(doc, slug, ref, current_section, text[s:e], s, e))
         i += 1
 
-    return _split_oversized(chunks)
+    return _split_oversized(chunks, doc=doc)
 
-def _split_oversized(chunks: list[Chunk], max_len: int = 2500) -> list[Chunk]:
+def _split_oversized(chunks: list[Chunk], max_len: int = MAX_CHUNK_LEN,
+                     doc: Optional[Document] = None) -> list[Chunk]:
     out: list[Chunk] = []
     for c in chunks:
         if len(c.text) <= max_len:
             out.append(c)
             continue
 
-        pieces = list(iter_paragraphs(c.text))
-        if not pieces or max(len(p[0]) for p in pieces) > max_len:
-            out.extend(_hard_split(c, max_len))
-            continue
+        pieces: list[Chunk] = []
+        par_pieces = list(iter_paragraphs(c.text))
+        if not par_pieces or max(len(p[0]) for p in par_pieces) > max_len:
+            pieces = _hard_split(c, max_len, doc=doc)
+        else:
+            buf_s, buf_e = -1, -1
+            idx = 0
+            for _t, ps, pe in par_pieces:
+                if buf_s < 0:
+                    buf_s, buf_e = ps, pe
+                elif pe - buf_s <= max_len:
+                    buf_e = pe
+                else:
+                    piece = c.text[buf_s:buf_e]
+                    pieces.append(_clone_with_text(c, piece, c.start + buf_s, c.start + buf_e, idx, doc=doc))
+                    idx += 1
+                    buf_s, buf_e = ps, pe
+            if buf_s >= 0:
+                piece = c.text[buf_s:buf_e]
+                pieces.append(_clone_with_text(c, piece, c.start + buf_s, c.start + buf_e, idx, doc=doc))
 
-        buf_s, buf_e = -1, -1
-        idx = 0
-        for _ptxt, ps, pe in pieces:
-            if buf_s < 0:
-                buf_s, buf_e = ps, pe
-            elif pe - buf_s <= max_len:  # границы в координатах c.text
-                buf_e = pe
-            else:
-                piece = c.text[buf_s:buf_e]  # ← вырезаем из родителя
-                out.append(_clone_with_text(c, piece, c.start + buf_s, c.start + buf_e, idx))
-                idx += 1
-                buf_s, buf_e = ps, pe
-        if buf_s >= 0:
-            piece = c.text[buf_s:buf_e]
-            out.append(_clone_with_text(c, piece, c.start + buf_s, c.start + buf_e, idx))
+        if len(pieces) > 1:
+            for k, p in enumerate(pieces):
+                p.meta["part_index"] = k
+                p.meta["part_count"] = len(pieces)
+        out.extend(pieces)
     return out
 
 _END_PUNCT_RE = re.compile(r'[\.\!\?\;\:]')
 
 
-def _hard_split(c: Chunk, max_len: int) -> list[Chunk]:
-    """Дробим один большой фрагмент по границам предложений (.;!?:), с точными координатами."""
+def _hard_split(c: Chunk, max_len: int, doc: Optional[Document] = None) -> list[Chunk]:
     text = c.text
     n = len(text)
     if n == 0:
         return [c]
 
-    # Индексы (в text) сразу после знаков . ! ? ; :
     boundaries = sorted({m.end() for m in _END_PUNCT_RE.finditer(text)})
     if not boundaries or boundaries[-1] != n:
         boundaries.append(n)
@@ -839,7 +1177,6 @@ def _hard_split(c: Chunk, max_len: int) -> list[Chunk]:
     idx = 0
     start = 0
     while start < n:
-        # максимальная граница, при которой длина ≤ max_len
         end = start
         for b in boundaries:
             if b <= start:
@@ -849,10 +1186,8 @@ def _hard_split(c: Chunk, max_len: int) -> list[Chunk]:
             else:
                 break
         if end == start:
-            # одно «предложение» длиннее max_len — режем по последнему пробелу
             space = text.rfind(' ', start, start + max_len)
             end = space if space > start else start + max_len
-        # обрезаем хвостовые пробелы, но НЕ меняем текст
         real_end = end
         while real_end > start and text[real_end - 1].isspace():
             real_end -= 1
@@ -863,19 +1198,23 @@ def _hard_split(c: Chunk, max_len: int) -> list[Chunk]:
                 start=c.start + start,
                 end=c.start + real_end,
                 idx=idx,
+                doc=doc,
             ))
             idx += 1
-        # перепрыгиваем пробелы
         start = end
         while start < n and text[start].isspace():
             start += 1
 
     return out
 
-def _clone_with_text(src: Chunk, text: str, start: int, end: int, idx: int) -> Chunk:
+
+def _clone_with_text(src: Chunk, text: str, start: int, end: int, idx: int,
+                     doc: Optional[Document] = None) -> Chunk:
     slug = src.chunk_id.split("#", 1)[1] + (f"_{idx}" if idx else "")
-    doc = _doc_cache.get(src.doc_id)
-    tfid = _build_text_for_index(doc, src.ref, src.section, _strip_leading_number(text)) if doc else text
+    tfid = (
+        _build_text_for_index(doc, src.ref, src.section, _strip_leading_number(text))
+        if doc else text
+    )
     return Chunk(
         chunk_id=f"{src.doc_id}#{slug}",
         doc_id=src.doc_id,
@@ -890,10 +1229,8 @@ def _clone_with_text(src: Chunk, text: str, start: int, end: int, idx: int) -> C
     )
 
 
-_doc_cache: dict[str, Document] = {}  # заполняется в load_kb
+# --- Законы ---
 
-
-# Законы
 def _law_unit_names(code: Optional[str]) -> tuple[str, Optional[str]]:
     code = code or ""
     if "НК" in code:
@@ -902,121 +1239,258 @@ def _law_unit_names(code: Optional[str]) -> tuple[str, Optional[str]]:
         return "ч", None
     if "152" in code:
         return "ч", "п"
+    if "-ФЗ" in code:
+        return "ч", "п"
     return "ч", None
 
-def _chunk_law_numbered(doc: Document) -> list[Chunk]:
+
+_IMPERATIVE_RE = re.compile(
+    r'^\s*(?:Установить|Определить|Предоставить|Обеспечить|Ввести|'
+    r'Признать|Утвердить|Возложить|Применять|Применяется|'
+    r'Установлен\w*|Определен\w*|Введен\w*|Дополнить|Исключить|Отменить)\b',
+    re.IGNORECASE,
+)
+
+
+def _is_norm_article_line(rest: str, source: Optional[str] = None) -> bool:
+    s = rest.strip()
+    if not s:
+        return False
+    if source:
+        s_norm = re.sub(r'\s+', ' ', s.lower())
+        src_norm = re.sub(r'\s+', ' ', source.lower())
+        if s_norm in src_norm:
+            return False
+        return True
+    if len(s) > 200 and re.search(r'[\.;]$', s):
+        return True
+    if _IMPERATIVE_RE.match(s):
+        return True
+    return False
+
+def _chunk_law_numbered(doc: Document, source: Optional[str] = None) -> list[Chunk]:
     text = doc.text
     top_name, sub_name = _law_unit_names(doc.law_code)
-    MAX = 2500
 
     body_start = 0
-    m = re.search(r'^Статья\s+[\d\.]+\..*$', text, re.MULTILINE)
-    if m:
-        body_start = m.end()
+    art_m = re.search(r'^Статья\s+([\d\.]+)\.\s*(.*)$', text, re.MULTILINE)
+    if art_m:
+        body_start = art_m.end()
 
-    notes_match = re.search(r'^\s*Примечани[ея]\s*\.?\s*$',
-                            text[body_start:], re.MULTILINE | re.IGNORECASE)
+    notes_match = re.search(
+        r'^\s*Примечани[ея]\b.*$',
+        text[body_start:],
+        re.MULTILINE | re.IGNORECASE,
+    )
     notes_pos = body_start + notes_match.start() if notes_match else None
 
     paras = [(t, s, e) for t, s, e in iter_paragraphs(text) if s >= body_start]
     if not paras:
         return _fallback_chunks(doc)
 
-    top_re = re.compile(r'^(\d+(?:\.\d+)?)\.\s')
+    top_re = re.compile(r'^(\d+(?:\.\d+)*(?:-\d+)?)\.\s')
     tops = [(i, m.group(1), s, e)
             for i, (t, s, e) in enumerate(paras)
             if (m := top_re.match(t))]
     if not tops:
         return _fallback_chunks(doc)
 
+    # P0-1: откат нумерации — только при реальном уменьшении целой части
+    rollback_pos = None
+    prev = 0
+    for _, num, s, _ in tops:
+        try:
+            n = int(num.split('.')[0])
+        except ValueError:
+            prev = 0
+            continue
+        if n < prev and prev >= 3:
+            rollback_pos = s
+            break
+        prev = n
+    if rollback_pos is not None and (notes_pos is None or rollback_pos < notes_pos):
+        notes_pos = rollback_pos
+
     chunks: list[Chunk] = []
-    seen: set[str] = set()
+
+    # Переходный текст до «Статья N.»
+    pre_paras = [(t, s, e) for t, s, e in iter_paragraphs(text) if e <= (art_m.start() if art_m else 0)]
+    if pre_paras and art_m:
+        pre_s = pre_paras[0][1]
+        pre_e = pre_paras[-1][2]
+        while pre_e > pre_s and text[pre_e - 1] in " \n":
+            pre_e -= 1
+        if pre_e > pre_s:
+            chunks.append(_make_chunk(
+                doc, "trans_pre",
+                f"переходное положение к ст. {doc.article}" if doc.article else "переходное положение",
+                None, text[pre_s:pre_e], pre_s, pre_e,
+            ))
+
+    # P0-3: текст между строкой «Статья N.» и первым пунктом
+    if tops:
+        first_top_start = tops[0][2]
+        mid_paras = [(t, s, e) for t, s, e in iter_paragraphs(text)
+                     if body_start <= s and e <= first_top_start]
+        if mid_paras:
+            mid_s = mid_paras[0][1]
+            mid_e = mid_paras[-1][2]
+            while mid_e > mid_s and text[mid_e - 1] in " \n":
+                mid_e -= 1
+            if mid_e > mid_s:
+                chunks.append(_make_chunk(
+                    doc, "trans_body",
+                    f"переходное положение к ст. {doc.article}" if doc.article else "переходное положение",
+                    None, text[mid_s:mid_e], mid_s, mid_e,
+                ))
+
+    seen_refs: set[str] = set()
+
+    def _emit(slug: str, ref: str, s: int, e: int) -> None:
+        if ref in seen_refs:
+            print(f"[kb] WARN: duplicate ref {ref!r} in {doc.doc_id}", file=sys.stderr)
+            slug = f"{slug}_dup"
+        seen_refs.add(ref)
+        chunks.append(_make_chunk(doc, slug, ref, None, text[s:e], s, e))
+
+    # P1-4: заголовок примечаний, содержащий номер на той же строке
+    notes_header_has_number = False
+    if notes_pos is not None:
+        line_end = text.find('\n', notes_pos)
+        if line_end < 0:
+            line_end = len(text)
+        first_line = text[notes_pos:line_end]
+        m = re.match(r'^\s*Примечани[ея][.:]?\s*(\d+(?:\.\d+)?)\.\s', first_line)
+        if m:
+            notes_header_has_number = True
+            num = m.group(1)
+            next_top_start = len(text)
+            for _, _, ts, _ in tops:
+                if ts > notes_pos:
+                    next_top_start = ts
+                    break
+            note_end = next_top_start
+            while note_end > notes_pos and text[note_end - 1] in " \n":
+                note_end -= 1
+            _emit(f"note{num}",
+                  f"прим. {num} к ст. {doc.article}" if doc.article else f"прим. {num}",
+                  notes_pos, note_end)
+
+    first_note_chunk_done = notes_header_has_number
 
     for ti, (pi, num, ps, pe) in enumerate(tops):
         end_of_top = tops[ti + 1][2] if ti + 1 < len(tops) else len(text)
+        if notes_pos is not None and ps < notes_pos < end_of_top:
+            end_of_top = notes_pos
         end_of_top = _trim_right(text, ps, end_of_top)
         in_notes = notes_pos is not None and ps >= notes_pos
 
         slug_base = f"note{num}" if in_notes else f"p{num}"
         if in_notes:
-            ref_base = f"прим. {num} к ст. {doc.article}" if doc.article else f"прим. {num}"
+            ref_base = (f"прим. {num} к ст. {doc.article}"
+                        if doc.article else f"прим. {num}")
         else:
-            ref_base = f"{top_name}. {num} ст. {doc.article}" if doc.article else f"{top_name}. {num}"
+            ref_base = (f"{top_name}. {num} ст. {doc.article}"
+                        if doc.article else f"{top_name}. {num}")
 
-        # Подпункты N) / N.M) — только если тип единицы их поддерживает
+        actual_start = ps
+        if in_notes and not first_note_chunk_done and notes_pos is not None:
+            actual_start = notes_pos
+            first_note_chunk_done = True
+
         subs: list[tuple[str, int, int]] = []
         if sub_name and not in_notes:
-            sub_re = re.compile(r'^(\d+(?:\.\d+)?)\)\s')
-            for j in range(pi + 1, len(paras)):
-                t, s, e = paras[j]
-                if s >= end_of_top:
-                    break
-                sm = sub_re.match(t)
-                if sm:
-                    subs.append((sm.group(1), s, e))
+            range_text = text[actual_start:end_of_top]
+            sub_matches = list(re.finditer(
+                r'^(\d+(?:\.\d+)*(?:-\d+)?)\)\s', range_text, re.MULTILINE,
+            ))
+            for k, sm in enumerate(sub_matches):
+                sub_num = sm.group(1)
+                sub_start = actual_start + sm.start()
+                sub_end = (actual_start + sub_matches[k + 1].start()
+                           if k + 1 < len(sub_matches) else end_of_top)
+                while sub_end > sub_start and text[sub_end - 1] in " \n":
+                    sub_end -= 1
+                subs.append((sub_num, sub_start, sub_end))
 
-        top_len = end_of_top - ps
-        if not subs or top_len <= MAX:
-            slug = slug_base if slug_base not in seen else f"{slug_base}_2"
-            seen.add(slug)
-            chunks.append(_make_chunk(doc, slug, ref_base, None,
-                                      text[ps:end_of_top], ps, end_of_top))
+        top_len = end_of_top - actual_start
+        has_subs = bool(subs)
+        if not has_subs or top_len <= SUBCHUNK_THRESHOLD:
+            _emit(slug_base, ref_base, actual_start, end_of_top)
             continue
 
-        # Вступление top-единицы
-        intro_end = _trim_right(text, ps, subs[0][1])
-        if intro_end > ps:
-            slug = slug_base if slug_base not in seen else f"{slug_base}_2"
-            seen.add(slug)
-            chunks.append(_make_chunk(doc, slug, ref_base, None,
-                                      text[ps:intro_end], ps, intro_end))
+        intro_end = _trim_right(text, actual_start, subs[0][1])
+        if intro_end > actual_start:
+            _emit(slug_base, ref_base, actual_start, intro_end)
 
-        # Подпункты
-        for si, (subnum, ss, _) in enumerate(subs):
-            sub_end = subs[si + 1][1] if si + 1 < len(subs) else end_of_top
-            sub_end = _trim_right(text, ss, sub_end)
-            sub_slug = f"{slug_base}.pp{subnum.replace('.', '-')}"
-            if sub_slug in seen:
-                sub_slug = f"{sub_slug}_2"
-            seen.add(sub_slug)
+        for si, (subnum, ss, se) in enumerate(subs):
+            sub_slug = f"{slug_base}.pp{subnum}"
             sub_ref = f"{sub_name}. {subnum} {ref_base}"
-            chunks.append(_make_chunk(doc, sub_slug, sub_ref, None,
-                                      text[ss:sub_end], ss, sub_end))
+            _emit(sub_slug, sub_ref, ss, se)
 
-    return _split_oversized(chunks)
+    return _split_oversized(chunks, doc=doc)
+
 
 _NUM_ITEM_RE = re.compile(r'^\d+(?:\.\d+)?\)\s')
-# _LAW_NOTE_RE = re.compile(
-#     r'^(?:О\s+конституционно-правов\w+\s+смысл\w+'
-#     r'|Согласно\s+Определени\w+\s+Конституционного\s+Суда'
-#     r'|Положени\w+\s+(?:статьи|части|пункта)\s+[\d\.]+\s*\(в\s+редакции)',
-#     re.IGNORECASE,
-# )
 _LAW_NOTE_RE = re.compile(
     r'^Положени\w+\s+(?:статьи|части|пункта)\s+[\d\.]+\s*\(в\s+редакции',
     re.IGNORECASE,
 )
-def _chunk_law_paragraphs(doc: Document) -> list[Chunk]:
+
+
+def _chunk_law_paragraphs(doc: Document, source: Optional[str] = None) -> list[Chunk]:
     text = doc.text
-    body_start = 0
-    m = re.search(r'^Статья\s+[\d\.]+\..*$', text, re.MULTILINE)
-    if m:
-        body_start = m.end()
+    art_m = re.search(r'^Статья\s+([\d\.]+)\.\s*(.*)$', text, re.MULTILINE)
+    if not art_m:
+        return _fallback_chunks(doc)
+
+    article_num = art_m.group(1)
+    rest = art_m.group(2)
+    body_start = art_m.end()
+
+    chunks: list[Chunk] = []
+    part_counter = 0
+
+    # Переходный текст до «Статья N.»
+    pre_paras = [(t, s, e) for t, s, e in iter_paragraphs(text) if e <= art_m.start()]
+    if pre_paras:
+        pre_s = pre_paras[0][1]
+        pre_e = pre_paras[-1][2]
+        while pre_e > pre_s and text[pre_e - 1] in " \n":
+            pre_e -= 1
+        if pre_e > pre_s:
+            chunks.append(_make_chunk(
+                doc, "trans_pre", f"переходное положение к ст. {article_num}",
+                None, text[pre_s:pre_e], pre_s, pre_e,
+            ))
+
+    # Норма в строке заголовка → это первая часть статьи
+    if _is_norm_article_line(rest, source=source):
+        norm_start = art_m.end() - len(rest)
+        line_end = art_m.end()
+        while line_end > norm_start and text[line_end - 1] in " \n":
+            line_end -= 1
+        if line_end > norm_start:
+            part_counter += 1
+            chunks.append(_make_chunk(
+                doc, f"ch{part_counter}", f"ч. {part_counter} ст. {article_num}",
+                None, text[norm_start:line_end], norm_start, line_end,
+            ))
 
     paras = [(t, s, e) for t, s, e in iter_paragraphs(text) if s >= body_start]
     if not paras:
-        return _fallback_chunks(doc)
+        return chunks if chunks else _fallback_chunks(doc)
 
-    groups: list[tuple[int, int, bool]] = []     # (start, end, is_note)
+    groups: list[tuple[int, int, bool]] = []
     cur = None
-    prev_colon = prev_open = False               # прошлый абзац кончается «:» / «:» или «;»
+    prev_colon = prev_open = False
     for t, s, e in paras:
         tt = t.rstrip()
         is_note = bool(_LAW_NOTE_RE.match(t))
         item = bool(_NUM_ITEM_RE.match(t)) or t[:1].islower()
         cont = (cur is not None and not is_note and not cur[2] and (
             prev_colon
-            or (prev_open and item)                                   # 2) …; 3) …
+            or (prev_open and item)
             or (t[:1].islower() and tt.endswith((";", ".")))
         ))
         if cont:
@@ -1030,29 +1504,28 @@ def _chunk_law_paragraphs(doc: Document) -> list[Chunk]:
     if cur:
         groups.append(tuple(cur))
 
-    chunks: list[Chunk] = []
-    n_part = n_note = 0
+    n_note = 0
     for s, e, is_note in groups:
         if is_note:
             n_note += 1
-            # slug = f"gnote{n_note}"
-            # ref = f"справка {n_note} к ст. {doc.article}" if doc.article else f"справка {n_note}"
             slug = f"trans{n_note}"
-            ref = f"переходное положение к ст. {doc.article}" if doc.article else f"переходное положение {n_note}"
+            ref = (f"переходное положение к ст. {article_num}"
+                   if article_num else f"переходное положение {n_note}")
         else:
-            n_part += 1
-            slug = f"ch{n_part}"
-            ref = f"ч. {n_part} ст. {doc.article}" if doc.article else f"ч. {n_part}"
+            part_counter += 1
+            slug = f"ch{part_counter}"
+            ref = f"ч. {part_counter} ст. {article_num}" if article_num else f"ч. {part_counter}"
         chunks.append(_make_chunk(doc, slug, ref, None, text[s:e], s, e))
-    return _split_oversized(chunks)
+
+    return _split_oversized(chunks, doc=doc)
 
 
-def _chunk_law(doc: Document) -> list[Chunk]:
-    # Эвристика: есть ли в теле статьи строки, начинающиеся с «N. »?
+def _chunk_law(doc: Document, source: Optional[str] = None) -> list[Chunk]:
     has_numbering = bool(re.search(r'^\d+(?:\.\d+)?\.\s', doc.text, re.MULTILINE))
     if has_numbering:
-        return _chunk_law_numbered(doc)
-    return _chunk_law_paragraphs(doc)
+        return _chunk_law_numbered(doc, source=source)
+    return _chunk_law_paragraphs(doc, source=source)
+
 
 
 def _trim_right(text: str, start: int, end: int) -> int:
@@ -1061,61 +1534,56 @@ def _trim_right(text: str, start: int, end: int) -> int:
     return end
 
 
-#  Допсоглашения/записки/письма 
+# --- Допсоглашения/записки/письма ---
 
 def _chunk_whole(doc: Document) -> list[Chunk]:
-    text = doc.text.strip()
-    if not text:
+    if not doc.text.strip():
         return []
     s, e = 0, len(doc.text)
     while s < e and doc.text[s] in " \n":
         s += 1
     while e > s and doc.text[e - 1] in " \n":
         e -= 1
+
     if doc.doc_type == "addendum":
-        slug, ref = "whole", f"доп. соглашение № {doc.number}" if doc.number else "доп. соглашение"
+        slug = "whole"
+        ref = f"доп. соглашение № {doc.number}" if doc.number else "доп. соглашение"
     elif doc.doc_type == "memo":
-        slug, ref = "whole", f"служебная записка № {doc.number}" if doc.number else "служебная записка"
+        slug = "whole"
+        ref = f"служебная записка № {doc.number}" if doc.number else "служебная записка"
     elif doc.doc_type == "letter":
-        slug, ref = "whole", f"письмо № {doc.number}" if doc.number else "письмо"
+        slug = "whole"
+        ref = f"письмо № {doc.number}" if doc.number else "письмо"
     else:
         slug, ref = "whole", doc.short_ref
+
     chunks = [_make_chunk(doc, slug, ref, None, doc.text[s:e], s, e)]
-    return _split_oversized(chunks)
+    return _split_oversized(chunks, doc=doc)
 
 
 def _chunk_memo_letter(doc: Document) -> list[Chunk]:
     if len(doc.text) < 2000:
         return _chunk_whole(doc)
-    # По абзацам
     chunks: list[Chunk] = []
     for idx, (t, s, e) in enumerate(iter_paragraphs(doc.text), start=1):
-        ref = f"абзац {idx}"
-        chunks.append(_make_chunk(doc, f"par{idx}", ref, None, t, s, e))
-    return _split_oversized(chunks)
+        chunks.append(_make_chunk(doc, f"par{idx}", f"абзац {idx}", None, t, s, e))
+    return _split_oversized(chunks, doc=doc)
 
 
-# Fallback 
 def _fallback_chunks(doc: Document) -> list[Chunk]:
     chunks: list[Chunk] = []
     for idx, (t, s, e) in enumerate(iter_paragraphs(doc.text), start=1):
-        ref = doc.short_ref
-        chunks.append(_make_chunk(doc, f"p{idx}", ref, None, t, s, e))
-
+        chunks.append(_make_chunk(doc, f"p{idx}", doc.short_ref, None, t, s, e))
     if not chunks:
-        # Весь текст — сплошные пробелы, или Document.text пуст
-        # _chunk_whole сам вернёт [] на пустом тексте и применит _split_oversized
         return _chunk_whole(doc)
+    return _split_oversized(chunks, doc=doc)
 
-    return _split_oversized(chunks)
 
-
-# Диспетчер 
 def chunk_document(doc: Document) -> list[Chunk]:
     if doc.doc_type in ("contract", "regulation"):
         return _chunk_contract_like(doc)
     if doc.doc_type == "law":
-        return _chunk_law(doc)
+        return _chunk_law(doc, source=doc.source_title)
     if doc.doc_type in ("addendum", "memo", "letter", "other"):
         if doc.doc_type in ("memo", "letter"):
             return _chunk_memo_letter(doc)
@@ -1123,51 +1591,56 @@ def chunk_document(doc: Document) -> list[Chunk]:
     return _fallback_chunks(doc)
 
 
+# Связи между документами 
 
-# Связи между документами
 def _link_addenda(documents: dict[str, Document]) -> None:
-    # Строим индекс номер→doc_id для договоров
     contract_by_number: dict[str, str] = {}
     for d in documents.values():
         if d.doc_type == "contract" and d.number:
-            for key in _number_variants(d.number):
-                contract_by_number[key] = d.doc_id
+            contract_by_number[normalize_number(d.number)] = d.doc_id
 
     for d in documents.values():
         if d.doc_type != "addendum" or not d.amends:
             continue
-        # Пересчитываем amends из текста, чтобы получить parent_number
         parsed = extract_amends(d.text)
         if not parsed:
             continue
         parent_num = parsed.get("parent_number")
         parent_id = None
         if parent_num:
-            for key in _number_variants(parent_num):
-                if key in contract_by_number:
-                    parent_id = contract_by_number[key]
-                    break
+            parent_id = contract_by_number.get(normalize_number(parent_num))
+
+        d.amends = {
+            "doc_id": parent_id,
+            "points": parsed.get("points", []),
+            "condition": parsed.get("condition"),
+        }
+
         if parent_id:
-            d.amends = {
-                "doc_id": parent_id,
-                "points": parsed.get("points", []),
-                "condition": parsed.get("condition"),
-            }
             parent = documents[parent_id]
             if d.doc_id not in parent.addenda:
                 parent.addenda.append(d.doc_id)
+            if d.counterparty is None or not d.counterparty.get("inn"):
+                d.counterparty = parent.counterparty
+            if d.number:
+                parent_ref_instr = re.sub(r'\bдоговор\b', 'договору', parent.short_ref, count=1)
+                d.short_ref = f"доп. соглашение № {d.number} к {parent_ref_instr}"
+            else:
+                parent_ref_instr = re.sub(r'\bдоговор\b', 'договору', parent.short_ref, count=1)
+                d.short_ref = f"доп. соглашение к {parent_ref_instr}"
 
 
 def _link_regulations(documents: dict[str, Document]) -> None:
     regs = [d for d in documents.values() if d.doc_type == "regulation"]
-    for i, a in enumerate(regs):
+    for a in regs:
+        wa = a.title.lower().split()[:3]
+        if not wa:
+            continue
         for b in regs:
             if a is b:
                 continue
-            # Совпадение по первым 3 словам title
-            wa = a.title.lower().split()[:3]
             wb = b.title.lower().split()[:3]
-            if wa and wb and wa == wb:
+            if wb and wa == wb:
                 if b.doc_id not in a.other_editions:
                     a.other_editions.append(b.doc_id)
 
@@ -1194,42 +1667,27 @@ def _annotate_amendments(documents: dict[str, Document], chunks: list[Chunk]) ->
                         lst.append(add_doc.doc_id)
 
 
-
-# Entities
-def _number_variants(num: str) -> list[str]:
-    if not num:
-        return []
-    raw = num.strip()
-    n = raw.lower()
-    variants = {raw, n}
-    variants.add(n.replace("/", "-"))
-    variants.add(n.replace("-", "/"))
-    variants.add(n.replace("/", ""))
-    variants.add(n.replace("-", ""))
-    look = str.maketrans({"а": "a", "п": "p", "с": "c", "е": "e",
-                          "о": "o", "х": "x", "у": "y", "к": "k"})
-    base = n.translate(look)
-    variants |= {base, base.replace("/", "-"), base.replace("/", "")}
-    return [v for v in variants if v]
+# ============ Entities ============
 
 def build_entities(documents: dict[str, Document]) -> Entities:
     counterparties: list[dict] = []
-    contracts: dict[str, str] = {}
+    # contracts: dict[str, str] = {}
+    contracts: ContractsDict = ContractsDict()
     by_type: dict[str, list[str]] = {}
 
     for d in documents.values():
         by_type.setdefault(d.doc_type, []).append(d.doc_id)
 
         if d.doc_type == "contract" and d.number:
-            for v in _number_variants(d.number):
-                contracts[v] = d.doc_id
+            key = normalize_number(d.number)
+            if key:
+                contracts[key] = d.doc_id
 
         if d.counterparty:
             name = d.counterparty["name"]
-            # Алиасы: без кавычек, без «ООО»-префикса
             short = re.sub(r'^(ООО|АО|ПАО|ЗАО|ИП)\s*[«"]', '', name).rstrip('»"')
-            aliases = {name, short}
-            # НЕ добавляем префиксные совпадения — оставляем только целые токены
+            alias_variants = {name, short, short.replace("-", " "), short.replace(" ", "-")}
+            aliases = {a for a in alias_variants if a}
             for ex in counterparties:
                 if ex["name"] == name:
                     if d.doc_id not in ex["doc_ids"]:
@@ -1251,10 +1709,9 @@ def build_entities(documents: dict[str, Document]) -> Entities:
     )
 
 
+# ============ editions_on ============
 
-# Editions on date
 def editions_on(d: date, docs: list[Document]) -> list[Document]:
-    """Документы, действовавшие на дату: valid_from <= d < valid_to (None = открыто)."""
     out: list[Document] = []
     for doc in docs:
         if doc.valid_from and doc.valid_from > d:
@@ -1264,19 +1721,25 @@ def editions_on(d: date, docs: list[Document]) -> list[Document]:
         out.append(doc)
     return out
 
+
+# ============ load_kb ============
+
 def load_kb(path: str | Path) -> KnowledgeBase:
     path = Path(path)
 
     if path.is_dir():
-        files = list(_iter_dir(path))
-        raw_all = b"".join(b for _, b in files)
+        files = sorted(_iter_dir(path), key=lambda x: x[0])
     else:
-        files = list(_iter_archive(path))
-        raw_all = path.read_bytes()
+        files = sorted(_iter_archive(path), key=lambda x: x[0])
 
-    kb_hash = hashlib.sha256(raw_all).hexdigest()
+    h = hashlib.sha256()
+    for name, data in files:
+        h.update(name.encode("utf-8"))
+        h.update(b"\x00")
+        h.update(data)
+    kb_hash = h.hexdigest()
 
-    # ---- 1. Документы ----
+    # 1. Документы
     documents: dict[str, Document] = {}
     for filename, raw in files:
         try:
@@ -1300,10 +1763,11 @@ def load_kb(path: str | Path) -> KnowledgeBase:
             doc.doc_id = f"{doc.doc_id}_{i}"
         documents[doc.doc_id] = doc
 
-    global _doc_cache
-    _doc_cache = documents
+    # 1.5. Связи до чанкинга — чтобы short_ref допсоглашения уже был с родителем
+    _link_addenda(documents)
+    _link_regulations(documents)
 
-    # ---- 2. Чанки ----
+    # 2. Чанки
     chunks: list[Chunk] = []
     for doc in documents.values():
         try:
@@ -1312,7 +1776,7 @@ def load_kb(path: str | Path) -> KnowledgeBase:
             print(f"[kb] WARN: cannot chunk {doc.doc_id}: {e}", file=sys.stderr)
             chunks.extend(_fallback_chunks(doc))
 
-    #safety-net
+    # safety-net по уникальности chunk_id
     seen_ids: dict[str, int] = {}
     for c in chunks:
         if c.chunk_id in seen_ids:
@@ -1325,26 +1789,33 @@ def load_kb(path: str | Path) -> KnowledgeBase:
         n = sum(1 for c in chunks if c.meta.get("duplicate_ref"))
         print(f"[kb] WARN: {n} chunk_id collisions auto-renamed", file=sys.stderr)
 
-    # Связи !после! safety-net
-    _link_addenda(documents)
-    _link_regulations(documents)
     _annotate_amendments(documents, chunks)
-
     entities = build_entities(documents)
+
+    # Индексы
+    chunk_by_id: dict[str, Chunk] = {}
+    ref_index: dict[tuple[str, str], list[Chunk]] = {}
+    for c in chunks:
+        chunk_by_id[c.chunk_id] = c
+        ref_index.setdefault((c.doc_id, _normalize_ref(c.ref)), []).append(c)
 
     return KnowledgeBase(
         documents=documents,
         chunks=chunks,
         entities=entities,
         kb_hash=kb_hash,
+        _chunk_by_id=chunk_by_id,
+        _ref_index=ref_index,
     )
 
+
+# ============ CLI ============
 
 def _main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="kb.py", description="Knowledge base loader")
     ap.add_argument("path", help="zip-архив или каталог с базой")
     ap.add_argument("--dump", default=None, help="куда записать chunks.jsonl")
-    ap.add_argument("--pretty", action="store_true", help="Отступы для лучшей читаемости")
+    ap.add_argument("--pretty", action="store_true", help="Отступы для читаемости")
     args = ap.parse_args(argv)
 
     try:
