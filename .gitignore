@@ -1,1 +1,11 @@
 data/
+docs/
+.env
+.venv/
+.idea/
+__pycache__/
+.pytest_cache/
+out/
+dist/
+CLAUDE.local.md
+.claude/hooks/
