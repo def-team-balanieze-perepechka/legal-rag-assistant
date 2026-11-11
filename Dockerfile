@@ -20,5 +20,9 @@ RUN mkdir -p /data /out && chown -R app:app /app /data /out
 
 USER app
 
+<<<<<<< HEAD
 
+=======
+EXPOSE 8000
+>>>>>>> 6e0c8d1 (feat(docker): containerize solution.py and scaffold api service)
 CMD ["python", "solution.py"]
