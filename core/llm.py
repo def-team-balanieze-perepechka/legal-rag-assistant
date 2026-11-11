@@ -68,9 +68,9 @@ class Settings:
             rerank_base_url=(env("DEV_RERANK_BASE_URL") or base).rstrip("/"),
             rerank_key=env("RERANKER_API_KEY") or key,
             temperature=env_float("TEMPERATURE", 0.0),
-            max_tokens=env_int("MAX_TOKENS", 1024, 128, 8192),
+            max_tokens=env_int("MAX_TOKENS", 4096, 128, 8192),
             extra_body=extra if isinstance(extra, dict) else {},
-            timeout=env_float("LLM_TIMEOUT", 90.0, 5.0, 600.0),
+            timeout=env_float("LLM_TIMEOUT", 180.0, 5.0, 600.0),
         )
 
     def describe(self) -> str:
@@ -157,13 +157,18 @@ class LLMClient:
 
     # API
 
-    def chat(self, messages: list[dict], max_tokens: int | None = None) -> str:
+    def chat(self, messages: list[dict], max_tokens: int | None = None) -> "Reply":
         payload = {"model": self.s.model, "messages": messages, "temperature": self.s.temperature,
                    "max_tokens": max_tokens or self.s.max_tokens, **self.s.extra_body}
         self.calls["chat"] += 1
         data = self._post(self.s.base_url, "/chat/completions", self.s.api_key, payload, retry_timeouts=False)
-        content = data["choices"][0]["message"].get("content") or ""
-        return strip_thinking(content)
+        choice = data["choices"][0]
+        reply = Reply(strip_thinking(choice["message"].get("content") or ""), choice.get("finish_reason"))
+        if reply.finish_reason == "length":
+            usage = data.get("usage") or {}
+            print(f"[llm] ответ оборван по лимиту max_tokens={payload['max_tokens']}: "
+                  f"completion_tokens={usage.get('completion_tokens')}, текст {len(reply)} символов", file=sys.stderr)
+        return reply
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         self._guard("embed")
@@ -200,6 +205,17 @@ class LLMClient:
             score = it.get("relevance_score", it.get("score"))
             out.append((int(it["index"]), float(score) if score is not None else -float(rank)))
         return out
+
+
+class Reply(str):
+    """Текст ответа модели + finish_reason («length» — оборван по max_tokens)."""
+
+    finish_reason: str | None
+
+    def __new__(cls, text: str, finish_reason: str | None = None) -> "Reply":
+        obj = super().__new__(cls, text)
+        obj.finish_reason = finish_reason
+        return obj
 
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.S)
