@@ -1038,32 +1038,6 @@ def test_law_status_always_active(kb):
             assert d.valid_from is None
             assert d.valid_to is None
 
-def test_law_always_active(kb):
-    """§2.4 фикс-ТЗ: фраза «утратила силу» в теле нормы не делает
-    закон недействующим. valid_* у законов всегда None."""
-    for d in kb.documents.values():
-        if d.doc_type != "law":
-            continue
-        assert d.status == "active", (
-            f"{d.doc_id}: status={d.status!r}, ожидалось 'active'"
-        )
-        assert d.valid_from is None, (
-            f"{d.doc_id}: valid_from={d.valid_from!r}, ожидалось None"
-        )
-        assert d.valid_to is None, (
-            f"{d.doc_id}: valid_to={d.valid_to!r}, ожидалось None"
-        )
-
-def test_editions_on_includes_laws_always(kb):
-    """Закон действует на любую дату — valid_* открыты."""
-    law_ids = {d.doc_id for d in kb.documents.values() if d.doc_type == "law"}
-    assert law_ids
-    for when in (date(2000, 1, 1), date(2026, 11, 11), date(2100, 1, 1)):
-        got = {d.doc_id for d in editions_on(when, list(kb.documents.values()))}
-        assert law_ids <= got, (
-            f"на {when} выпали законы: {law_ids - got}"
-        )
-
 def test_law_index_prefix_not_expired(kb):
     """Статус закона в префиксе text_for_index — «(действующая)».
 
@@ -1168,3 +1142,97 @@ def test_dashed_refs_keep_number_in_index(kb):
         c = kb.find_ref(doc_id, ref)
         assert c is not None
         assert needle in c.text_for_index, c.text_for_index[:120]
+
+
+# Ревью 11.11.2026: замечания к обновлённой ветке feat/kb
+
+
+def test_auto_prolonged_contract_has_open_valid_to(kb):
+    """«Действует до 31.12.2024 и автоматически продлевается» —
+    срок не закрыт: ПТ-05/2023 действует и в 2025–2026 годах."""
+    pt = kb.documents["contract_pt-05-2023"]
+    assert pt.valid_to is None, f"valid_to={pt.valid_to!r}"
+    p17 = kb.documents["contract_p-17-2024"]
+    assert p17.valid_to == date(2026, 12, 31)
+
+    got = {d.doc_id for d in editions_on(date(2025, 6, 1), list(kb.documents.values()))}
+    assert "contract_pt-05-2023" in got
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("договор с Альфа-Трейдом", ["ООО «Альфа-Трейд»"]),
+    ("поставка от Альфа-Трейдингом", ["ООО «Альфа-Трейдинг»"]),
+    ("гарантия у Альфа-Трейдинга", ["ООО «Альфа-Трейдинг»"]),
+    ("аренда у Северного Склада", ["ООО «Северный Склад»"]),
+    ("договор с Северным Складом", ["ООО «Северный Склад»"]),
+    ("с альфа трейдом", ["ООО «Альфа-Трейд»"]),
+])
+def test_match_counterparties_declensions(kb, text, expected):
+    """Названия в вопросах склоняются; Трейд и Трейдинг по-прежнему различаются."""
+    got = [cp["name"] for cp in kb.match_counterparties(text)]
+    assert got == expected, f"{text!r}: {got}"
+
+
+def test_kb_constructed_by_tz_signature_has_indexes(kb):
+    """KnowledgeBase(documents, chunks, entities, kb_hash) из ТЗ сам строит индексы."""
+    from kb import KnowledgeBase
+    kb2 = KnowledgeBase(kb.documents, kb.chunks, kb.entities, kb.kb_hash)
+    first = kb.chunks[0]
+    assert kb2.get_chunk(first.chunk_id) is first
+    assert kb2.find_ref("contract_a-08-2024", "п. 3.1") is not None
+
+
+def test_expired_only_from_status_line():
+    """«утратила силу с …» внутри пункта не делает весь документ недействующим."""
+    from kb import parse_document
+    text = (
+        "ДОГОВОР ПОСТАВКИ № П-1/2025\n"
+        "г. Москва — 1 марта 2025 г.\n"
+        "ООО «Тест» (ИНН 1234567890) и ООО «Меридиан» (ИНН 7709876543)\n"
+        "1. Предмет договора\n"
+        "1.1. Редакция спецификации от 01.02.2025 утратила силу с 01.03.2025.\n"
+    )
+    d = parse_document("договор.txt", text)
+    assert d.status == "active", f"status={d.status!r}"
+    assert d.valid_to is None
+
+
+def test_addendum_valid_from_is_signing_date(kb):
+    """Допсоглашение действует с даты подписания, а не «всегда»."""
+    add = kb.documents["addendum_1_p-17-2024"]
+    assert add.valid_from == date(2024, 9, 3), f"valid_from={add.valid_from!r}"
+    before = {d.doc_id for d in editions_on(date(2024, 7, 1), list(kb.documents.values()))}
+    assert add.doc_id not in before
+
+
+@pytest.mark.parametrize("rest,source,is_norm", [
+    ("Испытание при приёме на работу",
+     "Статья 70. ТК РФ Испытание при приеме на работу. Трудовой кодекс", False),
+    ("Согласие субъекта на обработку «его» данных",
+     'Статья 9. Согласие субъекта на обработку "его" данных. Федеральный закон', False),
+    ("Установить минимальный размер оплаты труда с 1 января 2026 года в сумме 27 093 рубля в месяц.",
+     "Статья 1. Федеральный закон от 19.06.2000 N 82-ФЗ", True),
+])
+def test_is_norm_article_line_tolerates_spelling(rest, source, is_norm):
+    """Название статьи узнаётся в шапке Гаранта и при ё/е, разных кавычках."""
+    from kb import _is_norm_article_line
+    assert _is_norm_article_line(rest, source=source) is is_norm
+
+
+def test_headings_not_shouting(kb):
+    """Заголовки и short_ref — в обычном регистре, без названия своей компании."""
+    r23 = kb.documents["reglament_soglasovaniya_2023"]
+    assert r23.title == "Регламент согласования договоров", f"title={r23.title!r}"
+    assert r23.short_ref == "Регламент согласования договоров, редакция от 10.01.2023"
+
+    add = kb.documents["addendum_1_p-17-2024"]
+    assert add.title == "Дополнительное соглашение № 1", f"title={add.title!r}"
+
+    memo = kb.documents["memo_yuo-7"]
+    assert memo.title == "О порядке хранения оригиналов договоров", f"title={memo.title!r}"
+
+
+def test_chunks_have_no_edge_whitespace(kb):
+    """Чанк не начинается и не заканчивается пробелом или переводом строки."""
+    bad = [c.chunk_id for c in kb.chunks if c.text != c.text.strip()]
+    assert not bad, f"пробелы по краям: {bad}"

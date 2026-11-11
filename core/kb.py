@@ -16,14 +16,6 @@ from datetime import date
 from pathlib import Path
 from typing import Iterator, Optional
 
-# try:
-#     import docx as _docx
-# except Exception:
-#     _docx = None
-
-
-# ============ Константы ============
-
 # "Своя" организация. Не хардкодим по файлу: одно место — одна замена.
 SELF_ORG_NAME = "меридиан"
 
@@ -35,7 +27,6 @@ MAX_CHUNK_LEN = 2500
 
 # Разрешённые расширения во входном архиве/каталоге.
 ALLOWED_EXTS = {".txt", ".md", ".docx"}
-
 
 # Латиница → кириллица для нормализации номеров договоров.
 _LAT_TO_CYR_NUM = {
@@ -66,7 +57,6 @@ def normalize_number(s: str) -> str:
     return ''.join(out)
 
 
-# ============ Dataclasses ============
 class ContractsDict(dict):
     """Словарь договоров с нормализацией ключей при доступе."""
 
@@ -149,6 +139,20 @@ class KnowledgeBase:
     _chunk_by_id: dict = field(default_factory=dict, repr=False)
     _ref_index: dict = field(default_factory=dict, repr=False)
 
+    def __post_init__(self) -> None:
+        # Индексы строим здесь, а не только в load_kb: объект, собранный
+        # по сигнатуре из ТЗ (documents, chunks, entities, kb_hash), тоже рабочий.
+        if not self._chunk_by_id and not self._ref_index:
+            self.reindex()
+
+    def reindex(self) -> None:
+        """Пересобрать индексы после изменения self.chunks."""
+        self._chunk_by_id = {}
+        self._ref_index = {}
+        for c in self.chunks:
+            self._chunk_by_id[c.chunk_id] = c
+            self._ref_index.setdefault((c.doc_id, _normalize_ref(c.ref)), []).append(c)
+
     def get_document(self, doc_id: str) -> Document:
         return self.documents[doc_id]
 
@@ -193,41 +197,39 @@ class KnowledgeBase:
                         return doc_id
         return None
 
-    
     def match_counterparties(self, text: str) -> list[dict]:
+        """Контрагенты, названные в тексте, с учётом падежных окончаний.
+
+        Алиасы проверяем от длинных к коротким и «съедаем» найденный
+        участок: «Альфа-Трейдинг» не даст ложного совпадения с «Альфа-Трейд».
+        """
         if not text:
             return []
-        lower = text.lower()
+        lower = text.lower().replace("ё", "е")
         all_aliases: list[tuple[str, dict]] = []
         for cp in self.entities.counterparties:
             for alias in cp["aliases"]:
-                all_aliases.append((alias.lower(), cp))
+                all_aliases.append((alias.lower().replace("ё", "е"), cp))
         all_aliases.sort(key=lambda x: -len(x[0]))
 
         consumed = [False] * len(lower)
         seen: set[str] = set()
         result: list[dict] = []
         for alias, cp in all_aliases:
-            start = 0
-            while True:
-                idx = lower.find(alias, start)
-                if idx < 0:
-                    break
-                end = idx + len(alias)
-                left_ok = idx == 0 or not lower[idx - 1].isalnum()
-                right_ok = end == len(lower) or not lower[end].isalnum()
-                if left_ok and right_ok and not any(consumed[idx:end]):
-                    if cp["name"] not in seen:
-                        seen.add(cp["name"])
-                        result.append(cp)
-                    for k in range(idx, end):
-                        consumed[k] = True
-                    break
-                start = idx + 1
+            pattern = _alias_pattern(alias)
+            if pattern is None:
+                continue
+            for m in pattern.finditer(lower):
+                if any(consumed[m.start():m.end()]):
+                    continue
+                if cp["name"] not in seen:
+                    seen.add(cp["name"])
+                    result.append(cp)
+                for k in range(m.start(), m.end()):
+                    consumed[k] = True
+                break
         return result
 
-
-# ============ Text utilities ============
 
 _WS_RE = re.compile(r"[ \t\u00A0\u202F]+")
 
@@ -303,6 +305,36 @@ def _normalize_ref(ref: str) -> str:
     r = re.sub(r'\s+', ' ', r).strip()
     return r
 
+
+_ADJ_ENDING_RE = re.compile(
+    r'(?:ого|его|ому|ему|ый|ий|ой|ая|яя|ое|ее|ые|ие|ым|им|ую|юю)$')
+
+
+def _alias_pattern(alias: str) -> Optional[re.Pattern]:
+    """Регулярка для названия контрагента с падежными окончаниями.
+
+    «северный склад» → находит «Северного Склада», «Северным Складом»;
+    «альфа-трейд» → «Альфа-Трейдом», но не «Альфа-Трейдинг»
+    (после основы допускается не больше двух букв окончания).
+    """
+    words = re.findall(r'[а-яёa-z0-9]+', alias.lower().replace("ё", "е"))
+    if not words:
+        return None
+    parts: list[str] = []
+    for w in words:
+        if len(w) > 4 and _ADJ_ENDING_RE.search(w):
+            base = _ADJ_ENDING_RE.sub('', w)
+            parts.append(re.escape(base) + r'[а-я]{1,3}')
+        elif len(w) > 3 and w[-1] in "аяоеьй":
+            parts.append(re.escape(w[:-1]) + r'[а-я]{0,3}')
+        elif w.isalpha():
+            parts.append(re.escape(w) + r'[а-я]{0,2}')
+        else:
+            parts.append(re.escape(w))
+    body = r'[\s\-«»"]+'.join(parts)
+    return re.compile(rf'(?<![а-яa-z0-9]){body}(?![а-яa-z0-9])')
+
+
 def _strip_leading_number(text: str) -> str:
     # Дефисные номера ("1.7-1.", "2.8-1)") не срезаем: они уже есть в ref,
     # а частичная обрезка ("1." → оставляет "7-1.") ломает text_for_index.
@@ -311,31 +343,12 @@ def _strip_leading_number(text: str) -> str:
         return text
     return re.sub(r'^\d+(?:\.\d+)*[\.\)]\s*', '', text, count=1)
 
-# ============ Rules: чистка законов от пометок Гаранта ============
 
 GARANT_HEADER_RE = [
     re.compile(r'^Источник:\s*(.+)$', re.MULTILINE),
     re.compile(r'^URL:\s*(\S+)$', re.MULTILINE),
     re.compile(r'^Дата выгрузки:\s*(.+)$', re.MULTILINE),
 ]
-
-# GARANT_HISTORY_LINE_RE = re.compile(
-#     r'^\s*('
-#     r'(?:Статья|Пункт|Подпункт|Часть|Абзац|Положени\w+)\s+'
-#     r'(?:[\d\.]+\s+)?'
-#     r'(?:изменен[аоы]?|дополнен[аоы]?|утратил[аи]?\s+силу|исключен[аоы]?)'
-#     r'(?:\s+с\s+[\d\.]+\s*(?:г\.|года)?)?'
-#     r'.*'
-#     r'|Федеральн(?:ым|ыми|ый|ые)\s+закон\w*\s+от\s+.*'
-#     r'|См\.\s+текст\s+.*'
-#     r'|Информация\s+об\s+изменениях.*'
-#     r'|О\s+проверке\s+конституционности.*'
-#     r'|О\s+[^\n]{5,300}?\sсм\.\s+(?:постановлени|определени|письм|разъяснени)\w*.*'
-#     # Строка «Cрок давности …» с латинской C (навигация Гаранта)
-#     r'|\u0043рок\s+давност[ьи]\s+привлечения.*'
-#     r')\s*$',
-#     re.MULTILINE | re.IGNORECASE,
-# )
 
 GARANT_KEEP_RE = re.compile(
     r'Положения\s+настоящего\s+(?:подпункта|пункта|абзаца)'
@@ -351,10 +364,12 @@ GARANT_HISTORY_RES = [
         r'.*$',
         re.MULTILINE | re.IGNORECASE,
     ),
-    re.compile(r'^\s*Федеральн(?:ым|ыми|ый|ые)\s+закон\w*\s+от\s+.*$', re.MULTILINE | re.IGNORECASE),
+    re.compile(r'^\s*Федеральн(?:ым|ыми|ый|ые)\s+закон\w*\s+от\s+.*$',
+               re.MULTILINE | re.IGNORECASE),
     re.compile(r'^\s*См\.\s+текст\s+.*$', re.MULTILINE | re.IGNORECASE),
     re.compile(r'^\s*Информация\s+об\s+изменениях.*$', re.MULTILINE | re.IGNORECASE),
-    re.compile(r'^\s*О\s+проверке\s+конституционности.*$', re.MULTILINE | re.IGNORECASE),
+    re.compile(r'^\s*О\s+проверке\s+конституционности.*$',
+               re.MULTILINE | re.IGNORECASE),
     re.compile(
         r'^\s*О\s+[^\n]{5,300}?\sсм\.\s+(?:постановлени|определени|письм|разъяснени)\w*.*$',
         re.MULTILINE | re.IGNORECASE,
@@ -363,7 +378,8 @@ GARANT_HISTORY_RES = [
         r'^\s*Обратите\s+внимание\b.*$',
         re.MULTILINE | re.IGNORECASE,
     ),
-    re.compile(r'^\s*\u0043рок\s+давност[ьи]\s+привлечения.*$', re.MULTILINE | re.IGNORECASE),
+    re.compile(r'^\s*\u0043рок\s+давност[ьи]\s+привлечения.*$',
+               re.MULTILINE | re.IGNORECASE),
 ]
 
 
@@ -387,7 +403,8 @@ def clean_law_text(raw: str) -> tuple[str, dict]:
     for line in raw.split('\n'):
         if any(r.search(line) for r in GARANT_HEADER_RE):
             continue
-        if any(r.search(line) for r in GARANT_HISTORY_RES) and not GARANT_KEEP_RE.search(line):
+        if any(r.search(line) for r in
+               GARANT_HISTORY_RES) and not GARANT_KEEP_RE.search(line):
             continue
         cleaned_lines.append(line)
 
@@ -410,8 +427,6 @@ def clean_law_text(raw: str) -> tuple[str, dict]:
     return "\n".join(out), header
 
 
-# ============ Чтение архива ============
-
 def _decode(filename: str, raw: bytes) -> str:
     name = filename.lower()
     if name.endswith(".docx"):
@@ -432,35 +447,6 @@ def _decode(filename: str, raw: bytes) -> str:
 
 _W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
 
-
-# def _read_docx(raw: bytes) -> str:
-#     # Если python-docx не справился (неполный OPC-архив, битый файл и т.п.),
-#     # откатываемся на ET, а не роняем разбор всего документа.
-#     if _docx is not None:
-#         try:
-#             doc = _docx.Document(io.BytesIO(raw))
-#             return "\n".join(p.text for p in doc.paragraphs)
-#         except Exception as e:
-#             print(
-#                 f"[kb] WARN: python-docx не смог разобрать DOCX ({e}); "
-#                 f"fallback на ElementTree",
-#                 file=sys.stderr,
-#             )
-#             # не return — уходим в ET-ветку ниже
-
-#     # Fallback через ElementTree — корректно раскодирует все XML-сущности,
-#     # включая числовые (&#171; → «, &#187; → »).
-#     with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-#         xml_bytes = zf.read("word/document.xml")
-#     try:
-#         root = ET.fromstring(xml_bytes)
-#     except ET.ParseError:
-#         return ""
-#     paragraphs: list[str] = []
-#     for p in root.iter(_W_NS + 'p'):
-#         parts = [t.text or "" for t in p.iter(_W_NS + 't')]
-#         paragraphs.append("".join(parts))
-#     return "\n".join(paragraphs)
 
 def _read_docx(raw: bytes) -> str:
     with zipfile.ZipFile(io.BytesIO(raw)) as zf:
@@ -499,8 +485,6 @@ def _iter_dir(path: Path) -> Iterator[tuple[str, bytes]]:
             yield f.name, f.read_bytes()
 
 
-# ============ Классификация документа ============
-
 def _first_significant_lines(text: str, n: int = 5) -> list[str]:
     """Первые n непустых строк, пропуская статусные строки «РЕДАКЦИЯ УТРАТИЛА СИЛУ…»."""
     result: list[str] = []
@@ -534,11 +518,12 @@ def extract_doc_type(filename: str, text: str) -> str:
     sig_lines = _first_significant_lines(text, 5)
 
     patterns = [
-        ("letter",     re.compile(r'^\s*(?:письмо\b|исх\.\s*№)', re.IGNORECASE)),
-        ("memo",       re.compile(r'^\s*служебная\s+записка\b', re.IGNORECASE)),
-        ("addendum",   re.compile(r'^\s*(?:дополнительное|доп\.)\s+соглашение\b', re.IGNORECASE)),
+        ("letter", re.compile(r'^\s*(?:письмо\b|исх\.\s*№)', re.IGNORECASE)),
+        ("memo", re.compile(r'^\s*служебная\s+записка\b', re.IGNORECASE)),
+        ("addendum",
+         re.compile(r'^\s*(?:дополнительное|доп\.)\s+соглашение\b', re.IGNORECASE)),
         ("regulation", re.compile(r'^\s*регламент\b', re.IGNORECASE)),
-        ("contract",   re.compile(r'^\s*договор\b', re.IGNORECASE)),
+        ("contract", re.compile(r'^\s*договор\b', re.IGNORECASE)),
     ]
     for line in sig_lines:
         for doc_type, pat in patterns:
@@ -559,7 +544,7 @@ def extract_doc_type(filename: str, text: str) -> str:
 
     return "other"
 
-# ============ Извлечение метаданных ============
+
 
 _ORG_RE = re.compile(
     r'(ООО|АО|ПАО|ЗАО|ИП)\s*[«"]([^»"]+)[»"]\s*\(?ИНН\s*(\d{9,12})',
@@ -581,9 +566,9 @@ def extract_counterparty(text: str, doc_type: str) -> Optional[dict]:
 
     # Без ИНН сразу после названия: «ООО «X» («Поставщик»)» / «ООО «X», именуемое…»
     for m in re.finditer(
-        r'(ООО|АО|ПАО|ЗАО|ИП)\s*[«"]([^»"]+)[»"]\s*(?:\([^)]*\)|,)?',
-        head,
-        re.IGNORECASE,
+            r'(ООО|АО|ПАО|ЗАО|ИП)\s*[«"]([^»"]+)[»"]\s*(?:\([^)]*\)|,)?',
+            head,
+            re.IGNORECASE,
     ):
         name = f"{m.group(1)} «{m.group(2)}»"
         if not any(c["name"] == name for c in candidates):
@@ -643,11 +628,15 @@ def extract_title(filename: str, text: str, doc_type: str) -> str:
                 continue
             if 'регламент' in s.lower():
                 # Убираем «(утратил силу)» и подобное
-                s = re.sub(r'\s*[\(\[]\s*утратил\w*\s+силу\s*[\)\]]?', '', s, flags=re.IGNORECASE)
-                return s.strip()
+                s = re.sub(r'\s*[\(\[]\s*утратил\w*\s+силу\s*[\)\]]?', '', s,
+                           flags=re.IGNORECASE)
+                # …и название своей компании: «… ООО «МЕРИДИАН»» попадало в ссылки ответов
+                s = re.sub(r'\s+(?:ООО|АО|ПАО|ЗАО)\s*[«"][^»"]*[»"]\s*$', '', s)
+                return _humanize_heading(s.strip())
         base = filename.split("__", 1)[-1]
         base = re.sub(r'\.(txt|md|docx)$', '', base, flags=re.IGNORECASE)
-        base = re.sub(r'[\s_,]*[\(\[]?\s*ред\.?\s*\d{4}\s*[\)\]]?', '', base, flags=re.IGNORECASE).strip(" _,")
+        base = re.sub(r'[\s_,]*[\(\[]?\s*ред\.?\s*\d{4}\s*[\)\]]?', '', base,
+                      flags=re.IGNORECASE).strip(" _,")
         return base or filename
 
     if doc_type == "contract":
@@ -664,15 +653,15 @@ def extract_title(filename: str, text: str, doc_type: str) -> str:
     if doc_type in ("memo", "letter"):
         # §3.3: title — тема документа («О …» / «Об …», «Служебная записка …»,
         # «Письмо …»), а не «Исх. № …» и не «ООО «…»».
-        # Два прохода: сначала тематические строки, потом «Исх. № …» как фолбэк.
-        for line in text.split('\n'):
-            s = line.strip()
-            if not s:
-                continue
-            if re.match(r'^(ООО|АО|ПАО|ЗАО)\b', s):
-                continue
+        # Проходы: тема «О …» (она в обычном регистре и понятнее),
+        # затем «Служебная записка …» / «Письмо …», затем «Исх. № …».
+        lines = [ln.strip() for ln in text.split('\n') if ln.strip()]
+        for s in lines:
             if s.lower().startswith(('о ', 'об ')):
                 return s
+        for s in lines:
+            if re.match(r'^(ООО|АО|ПАО|ЗАО)\b', s):
+                continue
             if 'служебная записка' in s.lower() or s.lower().startswith('письмо'):
                 return s
         for line in text.split('\n'):
@@ -685,9 +674,24 @@ def extract_title(filename: str, text: str, doc_type: str) -> str:
 
     first = text.split("\n", 1)[0].strip() if text else ""
     if first:
-        return first
+        return _humanize_heading(first) if doc_type == "addendum" else first
     base = filename.split("__", 1)[-1]
     return base.rsplit(".", 1)[0]
+
+
+def _humanize_heading(s: str) -> str:
+    """«ДОПОЛНИТЕЛЬНОЕ СОГЛАШЕНИЕ № 1» → «Дополнительное соглашение № 1».
+
+    Регистр меняем только у части до «№» и только если она целиком
+    заглавная: номер («ЮО-7», «П-17/2024») не трогаем.
+    """
+    head, sep, tail = s.partition("№")
+    hp = head.strip()
+    if hp and hp.isupper():
+        hp = hp.lower().capitalize()
+    if sep:
+        return f"{hp} №{tail}"
+    return hp or s
 
 
 _LAW_CODES = [
@@ -750,15 +754,19 @@ def extract_validity(text: str, doc_type: str = "other"
     if m:
         vf = parse_russian_date(m.group(1))
 
-    m = re.search(r'УТРАТИЛА\s+СИЛУ\s+с\s+(\d{2}\.\d{2}\.\d{4}|\d{1,2}\s+[а-яё]+\s+\d{4})',
-                  text, re.IGNORECASE)
+    # Статус документа — только строка-пометка в начале («РЕДАКЦИЯ УТРАТИЛА СИЛУ с …»).
+    # Та же фраза внутри пункта относится к отдельной норме, а не к документу.
+    m = re.search(r'^\s*(?:РЕДАКЦИЯ\s+|ДОКУМЕНТ\s+)?УТРАТИЛ[АО]?\s+СИЛУ\s+с\s+'
+                  r'(\d{2}\.\d{2}\.\d{4}|\d{1,2}\s+[а-яё]+\s+\d{4})',
+                  text[:500], re.IGNORECASE | re.MULTILINE)
     if m:
         vt = parse_russian_date(m.group(1))
         if vt:
             status = "expired"
 
     if vf is None:
-        m = re.search(r'Редакция\s+от\s+(\d{2}\.\d{2}\.\d{4}|\d{1,2}\s+[а-яё]+\s+\d{4})', text)
+        m = re.search(
+            r'Редакция\s+от\s+(\d{2}\.\d{2}\.\d{4}|\d{1,2}\s+[а-яё]+\s+\d{4})', text)
         if m:
             vf = parse_russian_date(m.group(1))
 
@@ -775,6 +783,7 @@ def extract_validity(text: str, doc_type: str = "other"
 
     return vf, vt, status
 
+
 def extract_amends(text: str) -> Optional[dict]:
     head = text[:1500]
     parent_number = None
@@ -788,7 +797,8 @@ def extract_amends(text: str) -> Optional[dict]:
             parent_number = m.group(1).rstrip(".,;")
 
     points: list[str] = []
-    for pm in re.finditer(r'пункт[аы]?\s+(\d+\.\d+(?:\s*,\s*\d+\.\d+)*)', text, re.IGNORECASE):
+    for pm in re.finditer(r'пункт[аы]?\s+(\d+\.\d+(?:\s*,\s*\d+\.\d+)*)', text,
+                          re.IGNORECASE):
         for num in re.findall(r'\d+\.\d+', pm.group(1)):
             if num not in points:
                 points.append(num)
@@ -851,7 +861,6 @@ def build_doc_id(doc_type, filename, title, number, law_code, article,
     return f"{doc_type}_{slugify(title)[:40] or 'doc'}"
 
 
-# ============ Парсинг одного документа ============
 
 def parse_document(filename: str, raw_text: str) -> Document:
     raw = normalize_text(raw_text)
@@ -895,7 +904,8 @@ def parse_document(filename: str, raw_text: str) -> Document:
         if dm:
             doc_date = parse_russian_date(dm.group(1))
 
-    if doc_type == "contract" and valid_from is None:
+    # Допсоглашение вступает в силу с даты подписания — как и договор.
+    if doc_type in ("contract", "addendum") and valid_from is None:
         valid_from = doc_date
 
     amends = None
@@ -920,7 +930,12 @@ def parse_document(filename: str, raw_text: str) -> Document:
             r'действует\s+до\s+(\d{1,2}\s+[а-яё]+\s+\d{4}|\d{2}\.\d{2}\.\d{4})',
             cleaned, re.IGNORECASE,
         )
-        if m:
+        # «… действует до 31 декабря 2024 г. и автоматически продлевается …» —
+        # срок не закрыт: дата в этом пункте лишь первый период действия.
+        sentence_end = cleaned.find("\n", m.end()) if m else -1
+        sentence = cleaned[
+                   m.end():sentence_end if sentence_end >= 0 else None] if m else ""
+        if m and not re.search(r'продлева|пролонгир', sentence, re.IGNORECASE):
             valid_to = parse_russian_date(m.group(1))
 
     return Document(
@@ -969,7 +984,6 @@ def _make_short_ref(doc_type, title, number, counterparty, law_code, article,
     return title[:80]
 
 
-# ============ Chunking ============
 
 _BLANK_LINE_RE = re.compile(r"\n\s*\n")
 
@@ -991,7 +1005,8 @@ def iter_paragraphs(text: str) -> Iterator[tuple[str, int, int]]:
 
 def _status_display(doc: Document) -> str:
     if doc.status == "expired":
-        verb = "утратил силу" if doc.doc_type in ("contract", "addendum") else "утратила силу"
+        verb = "утратил силу" if doc.doc_type in (
+        "contract", "addendum") else "утратила силу"
         if doc.valid_to:
             return f"{verb} с {doc.valid_to.strftime('%d.%m.%Y')}"
         return verb
@@ -1008,6 +1023,7 @@ def _doc_prefix_for_index(doc: Document) -> str:
         base = base[0].upper() + base[1:]
     return f"{base} ({_status_display(doc)})."
 
+
 def _ref_for_index(ref: str) -> str:
     if not ref:
         return ref
@@ -1016,13 +1032,15 @@ def _ref_for_index(ref: str) -> str:
     return ref
 
 
-def _build_text_for_index(doc: Document, ref: str, section: Optional[str], content: str) -> str:
+def _build_text_for_index(doc: Document, ref: str, section: Optional[str],
+                          content: str) -> str:
     parts = [_doc_prefix_for_index(doc)]
     if section and not ref.startswith("раздел"):
         parts.append(f"Раздел {section}.")
     parts.append(_ref_for_index(ref) + ".")
     parts.append(content)
     return " ".join(parts)
+
 
 _REPEALED_RE = re.compile(
     r'^\W*(?:\d+(?:\.\d+)*(?:-\d+)?[.)]\s*)?'
@@ -1064,7 +1082,6 @@ def _is_suspicious(text: str) -> bool:
     return bool(_SUSPICIOUS_RE.search(text))
 
 
-# --- Договоры и регламенты ---
 
 _SECTION_RE = re.compile(r'^(\d+)\.\s+([А-ЯЁA-Z][^\n]*)$', re.MULTILINE)
 _POINT_RE = re.compile(r'^(\d+\.\d+)\.\s+', re.MULTILINE)
@@ -1089,7 +1106,8 @@ def _chunk_contract_like(doc: Document) -> list[Chunk]:
                 s += 1
             while e > s and text[e - 1] in " \n":
                 e -= 1
-            chunks.append(_make_chunk(doc, "preamble", "преамбула", None, text[s:e], s, e))
+            chunks.append(
+                _make_chunk(doc, "preamble", "преамбула", None, text[s:e], s, e))
 
     current_section: Optional[str] = None
     i = 0
@@ -1111,7 +1129,8 @@ def _chunk_contract_like(doc: Document) -> list[Chunk]:
                     e -= 1
                 slug = "requisites" if "реквизит" in current_section.lower() else f"s{sec_num}"
                 ref = f"раздел {sec_num} (реквизиты)" if slug == "requisites" else f"раздел {sec_num}"
-                chunks.append(_make_chunk(doc, slug, ref, current_section, text[s:e], s, e))
+                chunks.append(
+                    _make_chunk(doc, slug, ref, current_section, text[s:e], s, e))
         else:
             next_pos = markers[i + 1][1] if i + 1 < len(markers) else len(text)
             s, e = pos, next_pos
@@ -1123,6 +1142,7 @@ def _chunk_contract_like(doc: Document) -> list[Chunk]:
         i += 1
 
     return _split_oversized(chunks, doc=doc)
+
 
 def _split_oversized(chunks: list[Chunk], max_len: int = MAX_CHUNK_LEN,
                      doc: Optional[Document] = None) -> list[Chunk]:
@@ -1146,12 +1166,16 @@ def _split_oversized(chunks: list[Chunk], max_len: int = MAX_CHUNK_LEN,
                     buf_e = pe
                 else:
                     piece = c.text[buf_s:buf_e]
-                    pieces.append(_clone_with_text(c, piece, c.start + buf_s, c.start + buf_e, idx, doc=doc))
+                    pieces.append(
+                        _clone_with_text(c, piece, c.start + buf_s, c.start + buf_e,
+                                         idx, doc=doc))
                     idx += 1
                     buf_s, buf_e = ps, pe
             if buf_s >= 0:
                 piece = c.text[buf_s:buf_e]
-                pieces.append(_clone_with_text(c, piece, c.start + buf_s, c.start + buf_e, idx, doc=doc))
+                pieces.append(
+                    _clone_with_text(c, piece, c.start + buf_s, c.start + buf_e, idx,
+                                     doc=doc))
 
         if len(pieces) > 1:
             for k, p in enumerate(pieces):
@@ -1159,6 +1183,7 @@ def _split_oversized(chunks: list[Chunk], max_len: int = MAX_CHUNK_LEN,
                 p.meta["part_count"] = len(pieces)
         out.extend(pieces)
     return out
+
 
 _END_PUNCT_RE = re.compile(r'[\.\!\?\;\:]')
 
@@ -1229,7 +1254,6 @@ def _clone_with_text(src: Chunk, text: str, start: int, end: int, idx: int,
     )
 
 
-# --- Законы ---
 
 def _law_unit_names(code: Optional[str]) -> tuple[str, Optional[str]]:
     code = code or ""
@@ -1252,14 +1276,22 @@ _IMPERATIVE_RE = re.compile(
 )
 
 
+def _loose_text(s: str) -> str:
+    """Нижний регистр, ё→е, только буквы и цифры через один пробел."""
+    s = s.lower().replace("ё", "е")
+    return " ".join(re.findall(r'[а-яa-z0-9]+', s))
+
+
 def _is_norm_article_line(rest: str, source: Optional[str] = None) -> bool:
     s = rest.strip()
     if not s:
         return False
     if source:
-        s_norm = re.sub(r'\s+', ' ', s.lower())
-        src_norm = re.sub(r'\s+', ' ', source.lower())
-        if s_norm in src_norm:
+        # Сравниваем без учёта ё/е, кавычек и пунктуации: в шапке Гаранта
+        # название может быть записано чуть иначе, чем в теле статьи.
+        s_norm = _loose_text(s)
+        src_norm = _loose_text(source)
+        if s_norm and s_norm in src_norm:
             return False
         return True
     if len(s) > 200 and re.search(r'[\.;]$', s):
@@ -1267,6 +1299,7 @@ def _is_norm_article_line(rest: str, source: Optional[str] = None) -> bool:
     if _IMPERATIVE_RE.match(s):
         return True
     return False
+
 
 def _chunk_law_numbered(doc: Document, source: Optional[str] = None) -> list[Chunk]:
     text = doc.text
@@ -1277,8 +1310,10 @@ def _chunk_law_numbered(doc: Document, source: Optional[str] = None) -> list[Chu
     if art_m:
         body_start = art_m.end()
 
+    # [ \t]*, а не \s*: иначе в MULTILINE захватывается пустая строка
+    # перед заголовком, и чанк примечания начинается с «\n».
     notes_match = re.search(
-        r'^\s*Примечани[ея]\b.*$',
+        r'^[ \t]*Примечани[ея]\b.*$',
         text[body_start:],
         re.MULTILINE | re.IGNORECASE,
     )
@@ -1314,7 +1349,8 @@ def _chunk_law_numbered(doc: Document, source: Optional[str] = None) -> list[Chu
     chunks: list[Chunk] = []
 
     # Переходный текст до «Статья N.»
-    pre_paras = [(t, s, e) for t, s, e in iter_paragraphs(text) if e <= (art_m.start() if art_m else 0)]
+    pre_paras = [(t, s, e) for t, s, e in iter_paragraphs(text) if
+                 e <= (art_m.start() if art_m else 0)]
     if pre_paras and art_m:
         pre_s = pre_paras[0][1]
         pre_e = pre_paras[-1][2]
@@ -1489,9 +1525,9 @@ def _chunk_law_paragraphs(doc: Document, source: Optional[str] = None) -> list[C
         is_note = bool(_LAW_NOTE_RE.match(t))
         item = bool(_NUM_ITEM_RE.match(t)) or t[:1].islower()
         cont = (cur is not None and not is_note and not cur[2] and (
-            prev_colon
-            or (prev_open and item)
-            or (t[:1].islower() and tt.endswith((";", ".")))
+                prev_colon
+                or (prev_open and item)
+                or (t[:1].islower() and tt.endswith((";", ".")))
         ))
         if cont:
             cur[1] = e
@@ -1527,14 +1563,12 @@ def _chunk_law(doc: Document, source: Optional[str] = None) -> list[Chunk]:
     return _chunk_law_paragraphs(doc, source=source)
 
 
-
 def _trim_right(text: str, start: int, end: int) -> int:
     while end > start and text[end - 1] in " \n":
         end -= 1
     return end
 
 
-# --- Допсоглашения/записки/письма ---
 
 def _chunk_whole(doc: Document) -> list[Chunk]:
     if not doc.text.strip():
@@ -1591,7 +1625,6 @@ def chunk_document(doc: Document) -> list[Chunk]:
     return _fallback_chunks(doc)
 
 
-# Связи между документами 
 
 def _link_addenda(documents: dict[str, Document]) -> None:
     contract_by_number: dict[str, str] = {}
@@ -1623,10 +1656,12 @@ def _link_addenda(documents: dict[str, Document]) -> None:
             if d.counterparty is None or not d.counterparty.get("inn"):
                 d.counterparty = parent.counterparty
             if d.number:
-                parent_ref_instr = re.sub(r'\bдоговор\b', 'договору', parent.short_ref, count=1)
+                parent_ref_instr = re.sub(r'\bдоговор\b', 'договору', parent.short_ref,
+                                          count=1)
                 d.short_ref = f"доп. соглашение № {d.number} к {parent_ref_instr}"
             else:
-                parent_ref_instr = re.sub(r'\bдоговор\b', 'договору', parent.short_ref, count=1)
+                parent_ref_instr = re.sub(r'\bдоговор\b', 'договору', parent.short_ref,
+                                          count=1)
                 d.short_ref = f"доп. соглашение к {parent_ref_instr}"
 
 
@@ -1667,11 +1702,9 @@ def _annotate_amendments(documents: dict[str, Document], chunks: list[Chunk]) ->
                         lst.append(add_doc.doc_id)
 
 
-# ============ Entities ============
 
 def build_entities(documents: dict[str, Document]) -> Entities:
     counterparties: list[dict] = []
-    # contracts: dict[str, str] = {}
     contracts: ContractsDict = ContractsDict()
     by_type: dict[str, list[str]] = {}
 
@@ -1686,7 +1719,8 @@ def build_entities(documents: dict[str, Document]) -> Entities:
         if d.counterparty:
             name = d.counterparty["name"]
             short = re.sub(r'^(ООО|АО|ПАО|ЗАО|ИП)\s*[«"]', '', name).rstrip('»"')
-            alias_variants = {name, short, short.replace("-", " "), short.replace(" ", "-")}
+            alias_variants = {name, short, short.replace("-", " "),
+                              short.replace(" ", "-")}
             aliases = {a for a in alias_variants if a}
             for ex in counterparties:
                 if ex["name"] == name:
@@ -1709,7 +1743,6 @@ def build_entities(documents: dict[str, Document]) -> Entities:
     )
 
 
-# ============ editions_on ============
 
 def editions_on(d: date, docs: list[Document]) -> list[Document]:
     out: list[Document] = []
@@ -1722,7 +1755,6 @@ def editions_on(d: date, docs: list[Document]) -> list[Document]:
     return out
 
 
-# ============ load_kb ============
 
 def load_kb(path: str | Path) -> KnowledgeBase:
     path = Path(path)
@@ -1792,24 +1824,15 @@ def load_kb(path: str | Path) -> KnowledgeBase:
     _annotate_amendments(documents, chunks)
     entities = build_entities(documents)
 
-    # Индексы
-    chunk_by_id: dict[str, Chunk] = {}
-    ref_index: dict[tuple[str, str], list[Chunk]] = {}
-    for c in chunks:
-        chunk_by_id[c.chunk_id] = c
-        ref_index.setdefault((c.doc_id, _normalize_ref(c.ref)), []).append(c)
-
+    # Индексы строит KnowledgeBase.__post_init__
     return KnowledgeBase(
         documents=documents,
         chunks=chunks,
         entities=entities,
         kb_hash=kb_hash,
-        _chunk_by_id=chunk_by_id,
-        _ref_index=ref_index,
     )
 
 
-# ============ CLI ============
 
 def _main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="kb.py", description="Knowledge base loader")
