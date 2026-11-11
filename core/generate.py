@@ -10,6 +10,10 @@ STATUSES = {"answer", "insufficient", "false_premise", "refuse_illegal", "offtop
 FAIL_ANSWER = ("Не удалось сформировать ответ по базе знаний."
                "Попробуйте переформулировать вопрос.")
 MAX_FRAGMENT_CHARS = 2600
+# Лимит ответа, если клиент не задал свой. Рассуждающие модели тратят его и на рассуждения:
+# при обрыве по лимиту повторяем тот же запрос с удвоенным лимитом, но не выше MAX_RETRY_TOKENS.
+DEFAULT_MAX_TOKENS = 4096
+MAX_RETRY_TOKENS = 8192
 
 
 def doc_label(doc) -> str:
@@ -94,11 +98,59 @@ def parse_json(text: str) -> dict | None:
     return None
 
 
+_FIELD_END_RE = re.compile(r'"\s*,\s*"(?:status|citations|missing_info)"\s*:|"\s*}\s*$')
+
+
+_ABBR_RE = re.compile(r"(?:^|[\s(])(?:п|пп|ч|ст|абз|прим|г|гг|руб|т|д|см|ред|им|ул|№)$", re.I)
+
+
+def trim_to_sentence(text: str) -> str:
+    """
+    Обрезает оборванный текст до последнего законченного
+    предложения (сокращения «п.», «ст.» — не конец).
+    """
+    for m in reversed(list(re.finditer(r"[.!?](?=\s|$)", text))):
+        if not _ABBR_RE.search(text[:m.start()]):
+            return text[:m.end()].strip()
+    return ""
+
+
+def salvage_json(text: str, cut: bool = False) -> dict | None:
+    """
+    Достает поля из сломанного JSON: неэкранированные кавычки внутри answer,
+    ответ, оборванный по лимиту токенов (cut=True — обрезаем до последнего
+    законченного предложения). Лучше частичный ответ, чем заглушка.
+    """
+    if not text:
+        return None
+    m = re.search(r'"answer"\s*:\s*"', text)
+    if not m:
+        return None
+    rest = text[m.end():]
+    end = _FIELD_END_RE.search(rest)
+    answer = rest[:end.start()] if end else rest.rstrip().rstrip('"}` \n')
+    answer = answer.replace('\\"', '"').replace("\\n", " ").strip()
+    if cut and not end:
+        answer = trim_to_sentence(answer)
+    if not answer:
+        return None
+    status = re.search(r'"status"\s*:\s*"(\w+)"', text)
+    cites = re.search(r'"citations"\s*:\s*\[(.*?)\]', text, re.S)
+    return {
+        "status": status.group(1) if status else "answer",
+        "answer": answer,
+        "citations": re.findall(r'"([^"]+)"', cites.group(1)) if cites else [],
+        "missing_info": "",
+    }
+
+
 def one_line(text: str) -> str:
     return " ".join(str(text).split())
 
 
-_REF_HINT_RE = re.compile(r"\b(п|пп|ч|ст|абз|прим)\.\s*\d|№\s*\S+|раздел|преамбул|записк|письм", re.I)
+# Ссылка на пункт или статью уже в тексте;
+# номер договора («№ А-08/2024») ссылкой на пункт не считается
+_REF_HINT_RE = re.compile(r"\b(п|пп|ч|ст|абз|прим)\.\s*\d|раздел|преамбул|записк|письм", re.I)
 
 
 def build_citations(ids: list[str], kb) -> list[dict]:
@@ -140,19 +192,27 @@ def generate(client, kb, question: str, history: list[dict] | None, chunks: list
         {"role": "user", "content": prompts.USER.format(
             history=format_history(history), question=question, fragments=format_fragments(chunks, kb))},
     ]
-    raw, obj = "", None
+    raw, obj, cut = "", None, False
+    limit = getattr(getattr(client, "s", None), "max_tokens", None) or DEFAULT_MAX_TOKENS
     for attempt in range(2):
         try:
-            raw = client.chat(messages)
+            raw = client.chat(messages, max_tokens=limit)
         except Exception as exc:
             print(f"[generate] LLM недоступна: {type(exc).__name__}: {exc}", file=sys.stderr)
             break
-        obj = parse_json(raw)
+        cut = getattr(raw, "finish_reason", None) == "length"
+        # оборванный ответ не чиним сразу: сначала повтор с бОльшим лимитом
+        obj = parse_json(raw) or (None if cut else salvage_json(raw))
         if obj and str(obj.get("answer", "")).strip():
             break
-        messages = messages + [{"role": "assistant", "content": raw},
-                               {"role": "user", "content": prompts.RETRY_JSON}]
         obj = None
+        if cut:
+            limit = min(MAX_RETRY_TOKENS, limit * 2)
+        else:
+            messages = messages + [{"role": "assistant", "content": raw},
+                                   {"role": "user", "content": prompts.RETRY_JSON}]
+    if obj is None and raw:
+        obj = salvage_json(raw, cut=cut)
 
     if obj is None:
         text = one_line(raw)
