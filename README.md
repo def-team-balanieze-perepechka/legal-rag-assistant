@@ -37,3 +37,19 @@ python scripts/build_submission.py   # dist/submission.zip, все файлы в
 ```
 
 Локально через Ollama: `ollama pull qwen3:4b` и `ollama pull bge-m3`, настройки — в конце `.env.example`. Реранкера в Ollama нет: без `DEV_RERANK_BASE_URL` поиск работает без него.
+
+## Запуск через Docker
+
+Проект можно запустить одной командой в контейнере — так же, как он работает на платформе:
+`DATA_DIR/questions.csv` + `DATA_DIR/knowledge-base.zip` → `SUBMISSION_PATH` (`out/submission.csv`).
+Docker-окружение не меняет код (`solution.py`, `core/`) и не содержит секретов: ключи и настройки
+передаются только через `.env`.
+
+### Что нужно заранее
+
+- **Docker** (Compose v2): `docker compose version` должен показывать 2.x.
+- **Ollama** на хосте (или любой другой OpenAI-совместимый API — см. ниже).
+- Для локальной Ollama — скачанные модели:
+  ```bash
+  ollama pull qwen3:4b     # LLM_MODEL
+  ollama pull bge-m3       # EMB_MODEL (эмбеддер для индекса)
