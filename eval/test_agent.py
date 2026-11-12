@@ -196,7 +196,7 @@ def test_generate_drops_unknown_citations_and_adds_source(kb):
 def test_generate_retries_once_then_fails_honestly(kb):
     client = FakeClient("{не json")
     res = gen.generate(client, kb, "вопрос", [], [])
-    assert client.calls["chat"] == 2
+    assert client.calls["chat"] == 2  # Без фрагментов запасной вызов не делаем
     assert res["status"] == "error" and res["answer"] == gen.FAIL_ANSWER
 
 
@@ -238,11 +238,11 @@ def test_generate_cut_answer_trimmed_to_last_sentence(kb):
     import llm
 
     cut = llm.Reply(
-        '{"status": "answer", "answer": "Нет. Оператор вправе продолжить обработку (п. 2). '
+        '{"status": "answer", "answer": "Нет. Оператор вправе продолжить обработку (п. 3.1). '
         'После отзыва согласия на обработку', "length")
     chunk = kb.get_chunk("contract_a-08-2024#p3.1")
     res = gen.generate(FakeClient(cut), kb, "Удалять всё?", [], [chunk])
-    assert res["answer"].startswith("Нет. Оператор вправе продолжить обработку (п. 2).")
+    assert res["answer"].startswith("Нет. Оператор вправе продолжить обработку (п. 3.1).")
     assert "После отзыва" not in res["answer"]
 
 
@@ -283,8 +283,9 @@ def test_source_added_when_answer_names_contract_but_no_clause(kb):
 
 @needs_data
 def test_generate_llm_down(kb):
-    res = gen.generate(FakeClient(RuntimeError("down")), kb, "вопрос", [], [])
-    assert res["answer"] == gen.FAIL_ANSWER
+    client = FakeClient(RuntimeError("down"))
+    res = gen.generate(client, kb, "вопрос", [], [])
+    assert res["answer"] == gen.FAIL_ANSWER and client.calls["chat"] == 1
 
 
 @needs_data
@@ -477,3 +478,196 @@ def test_prompt_does_not_push_yes_and_addresses_user_directly():
     s = prompts.system_prompt(False)
     assert "«Да.»" not in s
     assert "на «вы»" in s
+
+
+def test_tax_topic_from_text():
+    assert kb_module.tax_topic("ставки налога на добавленную стоимость; "
+                               "добавленную стоимость; прибыль организаций") \
+        .startswith("НДС")
+    assert kb_module.tax_topic("налог на доходы физических лиц").startswith("НДФЛ")
+    assert kb_module.tax_topic("налог на прибыль организаций").startswith("налог на прибыль")
+    assert kb_module.tax_topic("арендная плата") is None
+
+
+@needs_data
+def test_law_docs_get_tax_topic_in_index_and_label(kb):
+    assert kb.documents["nk_164"].topic.startswith("НДС")
+    assert kb.documents["nk_284"].topic.startswith("налог на прибыль")
+    assert kb.documents["contract_a-08-2024"].topic is None
+    assert "НДС" in kb.get_chunk("nk_164#p3").text_for_index
+    assert "(НДС" in gen.doc_label(kb.documents["nk_164"])
+    assert kb.documents["nk_164"].short_ref == "НК РФ, ст. 164"
+
+
+@needs_data
+@pytest.mark.parametrize("q", ["Какая общая ставка НДС, если льготные ставки не применяются?",
+                               "Общая ставка НДС ведь 20%? Её и указываем в счёте?"])
+def test_vat_question_finds_nk_164(kb, q):
+    # Без реранкера (BM25) — статья о ставках НДС, а не налога на прибыль с тем же заголовком
+    r = Retriever(kb, None)
+    ids = [h.chunk.chunk_id for h in r.search(q, top_k=8)]
+    assert any(i.startswith("nk_164#") for i in ids)
+    assert not any(i.startswith(("nk_284#", "nk_224#")) for i in ids)
+    if "льготные" not in q:
+        return
+    # Нужный пункт попадает в пул реранкера (для «ведь 20%?» BM25 без эмбеддингов его не находит)
+    pool = []
+    r._rerank = lambda query, p: pool.extend(p) or None
+    r.search(q, top_k=8)
+    assert "nk_164#p3" in [r.chunks[i].chunk_id for i in pool]
+
+
+def test_prompt_answers_only_the_question():
+    import prompts
+
+    s = prompts.system_prompt(False)
+    assert "Полнота" not in s and "обязательно коротко назови" not in s
+    assert "Только по вопросу" in s
+
+
+@needs_data
+@pytest.mark.parametrize("status", ["insufficient", "offtopic", "refuse_illegal"])
+def test_no_source_suffix_on_refusal(kb, status):
+    reply = json.dumps({"status": status, "answer": "Сведений о МРОТ за 2024 год в базе нет.",
+                        "citations": ["mrot_1#ch1"]}, ensure_ascii=False)
+    chunk = kb.get_chunk("mrot_1#ch1")
+    res = gen.generate(FakeClient(reply), kb, "МРОТ в 2024?", [], [chunk])
+    assert "Источник" not in res["answer"]
+
+
+@needs_data
+def test_unknown_clause_ref_removed(kb):
+    chunks = [kb.get_chunk("tk_99#ch6")]
+    text = "Не более 120 часов в год (ТК РФ, ст. 99, ч. 6); можно до 240 часов по коллективному договору (п. 3.1)."
+    out = gen.drop_unknown_clause_refs(text, chunks)
+    assert "(п. 3.1)" not in out and "ст. 99, ч. 6" in out
+    assert out.endswith("коллективному договору.")
+
+
+@needs_data
+@pytest.mark.parametrize("text", ["Приёмка по качеству — 5 рабочих дней (п. 6.1).",
+                                  "Приёмка — 5 дней (п. 6.1, 9.9).",
+                                  "Проверка дополняет порядок регламента (п. 5.4)."])
+def test_known_clause_ref_kept(kb, text):
+    chunks = [kb.get_chunk("contract_p-17-2024#p6.1"), kb.get_chunk("letter_k-12#whole")]
+    assert gen.drop_unknown_clause_refs(text, chunks) == text
+
+
+@needs_data
+def test_generate_drops_invented_clause(kb):
+    reply = json.dumps({"status": "answer", "answer": "Плата — 450 000 рублей (п. 3.1), залог (п. 7.7).",
+                        "citations": ["contract_a-08-2024#p3.1"]}, ensure_ascii=False)
+    res = gen.generate(FakeClient(reply), kb, "Аренда?", [], [kb.get_chunk("contract_a-08-2024#p3.1")])
+    assert "(п. 3.1)" in res["answer"] and "7.7" not in res["answer"]
+
+
+A08 = ["contract_a-08-2024#p3.1", "contract_a-08-2024#p3.2", "contract_a-08-2024#p3.4", "contract_a-08-2024#p3.5"]
+
+
+@needs_data
+def test_fallback_call_after_two_failures(kb, monkeypatch):
+    import llm
+
+    monkeypatch.delenv("LLM_NO_THINK", raising=False)
+    client = FakeClient([llm.Reply("", "length"), llm.Reply("", "length"),
+                         llm.Reply("Арендная плата — 450 000 рублей в месяц (п. 3.1).", "stop")])
+    res = gen.generate(client, kb, "Какая аренда?", [], [kb.get_chunk(c) for c in A08])
+    assert client.calls["chat"] == 3
+    assert res["answer"].startswith("Арендная плата — 450 000 рублей") and res["status"] == "answer"
+    assert res["fallback"] is True and res["raw_ok"] is False
+    assert [c["chunk_id"] for c in res["citations"]] == A08[:1]  # цитируем только использованный пункт
+    assert client.max_tokens[2] == gen.MAX_RETRY_TOKENS
+    assert fragment_ids(client.messages[2]) == A08[:3]
+    assert "JSON" not in client.messages[2][0]["content"] and "/no_think" not in client.messages[2][-1]["content"]
+
+
+@needs_data
+def test_fallback_no_think_flag(kb, monkeypatch):
+    import llm
+
+    monkeypatch.setenv("LLM_NO_THINK", "1")
+    client = FakeClient([llm.Reply("", "length"), llm.Reply("", "length"), llm.Reply("Плата 450 000 (п. 3.1).")])
+    gen.generate(client, kb, "Какая аренда?", [], [kb.get_chunk(A08[0])])
+    assert client.messages[2][-1]["content"].rstrip().endswith("/no_think")
+
+
+@needs_data
+def test_fallback_failure_returns_stub(kb):
+    import llm
+
+    client = FakeClient(llm.Reply("", "length"))
+    res = gen.generate(client, kb, "Какая аренда?", [], [kb.get_chunk(A08[0])])
+    assert client.calls["chat"] == 3 and res["answer"] == gen.FAIL_ANSWER and res["status"] == "error"
+
+
+@needs_data
+def test_tax_filter_uses_current_question_first(kb):
+    r = Retriever(kb, None)
+    hits = r.search("а какая ставка налога на прибыль для иностранных организаций?", top_k=8,
+                    context="Какая общая ставка НДС?", entity_context="Какая общая ставка НДС?")
+    ids = [h.chunk.chunk_id for h in hits]
+    assert any(i.startswith("nk_284#") for i in ids) and not any(i.startswith("nk_164#") for i in ids)
+
+
+@needs_data
+def test_tax_filter_ignores_assistant_only_mention(kb):
+    from search import query_tax_topic
+    assert query_tax_topic("ставка для нерезидентов") is None
+
+
+@needs_data
+def test_fallback_cites_only_used_fragments(kb):
+    import llm
+
+    client = FakeClient([llm.Reply("", "length"), llm.Reply("", "length"),
+                         llm.Reply("Арендная плата — 450 000 рублей в месяц (п. 3.1).", "stop")])
+    res = gen.generate(client, kb, "Какая аренда?", [], [kb.get_chunk(c) for c in A08])
+    assert [c["chunk_id"] for c in res["citations"]] == [A08[0]]
+
+
+@needs_data
+def test_fallback_refusal_is_insufficient_without_source(kb):
+    import llm
+
+    client = FakeClient([llm.Reply("", "length"), llm.Reply("", "length"),
+                         llm.Reply("Во фрагментах нет сведений о сроке оплаты; не хватает договора.", "stop")])
+    res = gen.generate(client, kb, "Срок оплаты?", [], [kb.get_chunk(c) for c in A08])
+    assert res["status"] == "insufficient" and "Источник" not in res["answer"] and res["citations"] == []
+
+
+@needs_data
+def test_fallback_rejects_thinking_text(kb):
+    import llm
+
+    client = FakeClient([llm.Reply("", "length"), llm.Reply("", "length"),
+                         llm.Reply("<think>Okay, the user asks about rent. Let me check.", "length")])
+    res = gen.generate(client, kb, "Какая аренда?", [], [kb.get_chunk(A08[0])])
+    assert res["answer"] == gen.FAIL_ANSWER
+
+
+@needs_data
+def test_no_fallback_when_llm_went_down(kb):
+    import llm
+
+    client = FakeClient([llm.Reply("", "length"), RuntimeError("down"), llm.Reply("Плата (п. 3.1).")])
+    res = gen.generate(client, kb, "Какая аренда?", [], [kb.get_chunk(A08[0])])
+    assert client.calls["chat"] == 2 and res["answer"] == gen.FAIL_ANSWER
+
+
+@needs_data
+@pytest.mark.parametrize("text", ["Арендная плата (п. 3).", "Плата вносится (пп. 3.1)."])
+def test_clause_prefix_of_known_ref_kept(kb, text):
+    assert gen.drop_unknown_clause_refs(text, [kb.get_chunk(c) for c in A08[:2]]) == text
+
+
+def test_known_ref_from_podpunkt_and_history():
+    class C:
+        ref, text = "п. 1 ст. 164", "в соответствии с подпунктом 4 настоящего пункта"
+    assert gen.drop_unknown_clause_refs("Ставка 0% (пп. 4).", [C()]) == "Ставка 0% (пп. 4)."
+    assert gen.drop_unknown_clause_refs("Как я писал (п. 9.9).", [C()], history="ранее (п. 9.9)") \
+        == "Как я писал (п. 9.9)."
+
+
+def test_fallback_prompt_refuses_illegal_and_offtopic():
+    import prompts
+    assert "противоправ" in prompts.FALLBACK_SYSTEM and "на «вы»" in prompts.FALLBACK_SYSTEM

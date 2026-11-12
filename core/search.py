@@ -19,6 +19,22 @@ _LAT2CYR = str.maketrans("abcehkmoptxy", "авсенкмортху")
 _NUMBER_RE = re.compile(r"(?<![\w])([a-zа-я]{1,3})\s*-?\s*(\d{1,4})\s*[/-]\s*(\d{2,4})(?![\w])", re.I)
 
 
+_QUERY_TAX = (
+    (re.compile(r"\bНДС\b|добавленн\w*\s+стоимост", re.I), "НДС, налог на добавленную стоимость"),
+    (re.compile(r"\bНДФЛ\b|доход\w*\s+физических\s+лиц", re.I), "НДФЛ, налог на доходы физических лиц"),
+    (re.compile(r"налог\w*\s+на\s+прибыль", re.I), "налог на прибыль организаций"),
+)
+
+
+def query_tax_topic(text: str) -> str | None:
+    """
+    Вид налога, названный в вопросе
+    (в тех же названиях, что kb.tax_topic); несколько — None.
+    """
+    found = {name for rx, name in _QUERY_TAX if rx.search(text or "")}
+    return found.pop() if len(found) == 1 else None
+
+
 def number_key(s: str) -> str:
     """
     Номер договора в каноническом виде:
@@ -196,6 +212,13 @@ class Retriever:
             fused = {i: s for i, s in fused.items()
                      if self.chunks[i].doc_id in named
                      or self.kb.documents[self.chunks[i].doc_id].doc_type not in ("contract", "addendum")}
+
+        # Назван вид налога — статьи о других налогах (тот же «Налоговые ставки»)
+        # убираем по текущему вопросу; иначе — по прошлым репликам пользователя
+        topic = query_tax_topic(query) or query_tax_topic(entity_context if entity_context is not None else context)
+        if topic:
+            fused = {i: s for i, s in fused.items()
+                     if self.kb.documents[self.chunks[i].doc_id].topic in (None, topic)}
 
         pool = sorted(fused, key=fused.get, reverse=True)[:RERANK_POOL]
         reranked = self._rerank(query if not context else full, pool)
