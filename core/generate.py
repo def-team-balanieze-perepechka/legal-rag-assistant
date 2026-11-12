@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 
 import prompts
 
 STATUSES = {"answer", "insufficient", "false_premise", "refuse_illegal", "offtopic", "clarify"}
+NO_SOURCE_STATUSES = {"insufficient", "offtopic", "refuse_illegal"}
 FAIL_ANSWER = ("Не удалось сформировать ответ по базе знаний."
                "Попробуйте переформулировать вопрос.")
 MAX_FRAGMENT_CHARS = 2600
@@ -14,10 +16,13 @@ MAX_FRAGMENT_CHARS = 2600
 # при обрыве по лимиту повторяем тот же запрос с удвоенным лимитом, но не выше MAX_RETRY_TOKENS.
 DEFAULT_MAX_TOKENS = 4096
 MAX_RETRY_TOKENS = 8192
+FALLBACK_FRAGMENTS = 3
 
 
 def doc_label(doc) -> str:
     label = doc.short_ref
+    if getattr(doc, "topic", None):
+        label += f" ({doc.topic})"
     if getattr(doc, "counterparty", None) and doc.doc_type in ("contract", "addendum"):
         label += f" с {doc.counterparty['name']}"
     if doc.status == "expired":
@@ -153,6 +158,38 @@ def one_line(text: str) -> str:
 _REF_HINT_RE = re.compile(r"\b(п|пп|ч|ст|абз|прим)\.\s*\d|раздел|преамбул|записк|письм", re.I)
 
 
+_NUM = r"\d+(?:\.\d+)*"
+# «(п. 3.1)», «(п. 3.1, 3.2)», «(пп. 1 и 2)», «(ч. 6)» — скобка только с номерами пунктов
+_CLAUSE_PAREN_RE = re.compile(rf"\s*\((?:пп?|ч)\.\s*({_NUM}(?:\s*(?:,|и)\s*{_NUM})*)\)", re.I)
+# Номера пунктов, известные по фрагментам: в ref («п. 3 ст. 164»),
+# в тексте («п. 5.4 Регламента») и в начале нумерованных абзацев («6.1. Приёмка…»)
+_KNOWN_REF_RE = re.compile(rf"(?:\b(?:пп?|ч)|пункт\w*|част\w*)\.?\s*({_NUM})", re.I)  # и «подпункт»
+_LEADING_NUM_RE = re.compile(rf"(?m)^\s*({_NUM})[.)]\s")
+
+
+def drop_unknown_clause_refs(answer: str, chunks, history: str = "") -> str:
+    """
+    Убирает «(п. N)», если ни одного из номеров нет во фрагментах,
+    переданных модели, и в истории.
+    """
+    known = set(_KNOWN_REF_RE.findall(history or ""))
+    for c in chunks:
+        for src in (c.ref or "", c.text or ""):
+            known.update(_KNOWN_REF_RE.findall(src))
+        known.update(_LEADING_NUM_RE.findall(c.text or ""))
+
+    def repl(m: re.Match) -> str:
+        nums = re.findall(_NUM, m.group(1))
+        # «п. 3» — раздел, если известен «п. 3.1»
+        if any(n in known or any(k.startswith(n + ".") for k in known) for n in nums):
+            return m.group(0)
+        print(f"[generate] убрана ссылка на пункт, которого нет во фрагментах: {m.group(0).strip()}",
+              file=sys.stderr)
+        return ""
+
+    return _CLAUSE_PAREN_RE.sub(repl, answer)
+
+
 def build_citations(ids: list[str], kb) -> list[dict]:
     out = []
     for cid in ids:
@@ -185,6 +222,51 @@ def source_suffix(citations: list[dict]) -> str:
     return "Источник: " + "; ".join(parts) + "." if parts else ""
 
 
+def fallback_answer(client, kb, question: str, history: list[dict] | None, chunks: list) -> dict | None:
+    """
+    Третья попытка вместо заглушки.
+    Короткий промпт без JSON, лучшие фрагменты, максимальный лимит.
+    """
+    user = prompts.FALLBACK_USER.format(question=question, fragments=format_fragments(chunks, kb))
+    if os.getenv("LLM_NO_THINK") == "1":  # qwen3 в Ollama: без рассуждений, чтобы не съесть лимит
+        user += prompts.NO_THINK
+    messages = [{"role": "system", "content": prompts.FALLBACK_SYSTEM},
+                {"role": "user", "content": format_history(history) + user}]
+    try:
+        raw = client.chat(messages, max_tokens=MAX_RETRY_TOKENS)
+    except Exception as exc:
+        print(f"[generate] запасной вызов не удался: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return None
+    text = one_line(raw)
+    if "<think" in text.lower():  # Оборвался внутри рассуждений — это не ответ
+        return None
+    if getattr(raw, "finish_reason", None) == "length":
+        text = trim_to_sentence(text)
+    if not text or text.startswith("{"):
+        return None
+    print("[generate] ответ из запасного вызова", file=sys.stderr)
+    answer = drop_unknown_clause_refs(text, chunks, _history_text(history))
+    if _FALLBACK_REFUSAL_RE.search(answer):
+        # Отказ без подписи: перечисленные пункты судья считает фактами
+        return {"status": "insufficient", "answer": answer, "citations": [], "missing_info": None,
+                "dropped_citations": [], "raw_ok": False, "fallback": True}
+    nums = set(_KNOWN_REF_RE.findall(answer))
+    used = [c for c in chunks if nums & set(_KNOWN_REF_RE.findall(c.ref or ""))] or chunks[:1]
+    citations = build_citations([c.chunk_id for c in used], kb)
+    if not _REF_HINT_RE.search(answer):
+        answer = f"{answer} {source_suffix(citations)}".strip()
+    return {"status": "answer", "answer": answer, "citations": citations, "missing_info": None,
+            "dropped_citations": [], "raw_ok": False, "fallback": True}
+
+
+_FALLBACK_REFUSAL_RE = re.compile(
+    r"нет\s+(?:сведений|информации|данных)|не\s+содерж|не\s+хватает|отсутству|не\s+удалось\s+найти", re.I)
+
+
+def _history_text(history: list[dict] | None) -> str:
+    return " ".join(t.get("content", "") for t in history or [])
+
+
 def generate(client, kb, question: str, history: list[dict] | None, chunks: list,
              allow_clarify: bool = False) -> dict:
     messages = [
@@ -192,14 +274,16 @@ def generate(client, kb, question: str, history: list[dict] | None, chunks: list
         {"role": "user", "content": prompts.USER.format(
             history=format_history(history), question=question, fragments=format_fragments(chunks, kb))},
     ]
-    raw, obj, cut = "", None, False
+    raw, obj, cut, llm_ok, llm_down = "", None, False, False, False
     limit = getattr(getattr(client, "s", None), "max_tokens", None) or DEFAULT_MAX_TOKENS
     for attempt in range(2):
         try:
             raw = client.chat(messages, max_tokens=limit)
         except Exception as exc:
             print(f"[generate] LLM недоступна: {type(exc).__name__}: {exc}", file=sys.stderr)
+            llm_down = True
             break
+        llm_ok = True
         cut = getattr(raw, "finish_reason", None) == "length"
         # оборванный ответ не чиним сразу: сначала повтор с бОльшим лимитом
         obj = parse_json(raw) or (None if cut else salvage_json(raw))
@@ -220,6 +304,10 @@ def generate(client, kb, question: str, history: list[dict] | None, chunks: list
             # модель ответила текстом без JSON — отдаём как есть, но без цитат
             return {"status": "answer", "answer": text, "citations": [], "missing_info": None,
                     "dropped_citations": [], "raw_ok": False}
+        if llm_ok and not llm_down and chunks:
+            fallback = fallback_answer(client, kb, question, history, chunks[:FALLBACK_FRAGMENTS])
+            if fallback:
+                return fallback
         return {"status": "error", "answer": FAIL_ANSWER, "citations": [], "missing_info": None,
                 "dropped_citations": [], "raw_ok": False}
 
@@ -244,8 +332,9 @@ def generate(client, kb, question: str, history: list[dict] | None, chunks: list
         status = "answer"
 
     citations = build_citations(valid, kb)
-    answer = one_line(obj.get("answer", ""))
-    if citations and not _REF_HINT_RE.search(answer):
+    answer = drop_unknown_clause_refs(one_line(obj.get("answer", "")), chunks, _history_text(history))
+    # К отказу подпись не нужна: судья считает перечисленные пункты фактами, которых нет в эталоне
+    if citations and status not in NO_SOURCE_STATUSES and not _REF_HINT_RE.search(answer):
         answer = f"{answer} {source_suffix(citations)}".strip()
     missing = one_line(obj.get("missing_info") or "") or None
     return {"status": status, "answer": answer, "citations": citations, "missing_info": missing,

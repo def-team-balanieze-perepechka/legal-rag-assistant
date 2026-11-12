@@ -96,6 +96,7 @@ class Document:
     exported_at: Optional[date] = None
     text: str = ""
     filename: str = ""
+    topic: Optional[str] = None  # вид налога для статей НК: заголовок «Налоговые ставки» у них одинаковый
 
     def meta_snapshot(self) -> dict:
         return {
@@ -1015,13 +1016,29 @@ def _status_display(doc: Document) -> str:
     return "действующая"
 
 
+_TAX_TOPICS = (
+    (re.compile(r"добавленн\w*\s+стоимост", re.I), "НДС, налог на добавленную стоимость"),
+    (re.compile(r"доход\w*\s+физических\s+лиц", re.I), "НДФЛ, налог на доходы физических лиц"),
+    (re.compile(r"прибыл\w*\s+организаци", re.I), "налог на прибыль организаций"),
+)
+
+
+def tax_topic(text: str) -> Optional[str]:
+    """Вид налога, о котором статья: по самой частой фразе в тексте."""
+    counts = [(len(rx.findall(text or "")), name) for rx, name in _TAX_TOPICS]
+    n, name = max(counts, key=lambda x: x[0])
+    return name if n else None
+
+
 def _doc_prefix_for_index(doc: Document) -> str:
     base = doc.short_ref
     if doc.doc_type == "contract" and doc.counterparty:
         base = f"{base} с {doc.counterparty['name']}"
     if base and base[0].islower():
         base = base[0].upper() + base[1:]
-    return f"{base} ({_status_display(doc)})."
+    # тема — после статуса: первая скобка префикса зарезервирована под статус
+    topic = f" {doc.topic[0].upper()}{doc.topic[1:]}." if doc.topic else ""
+    return f"{base} ({_status_display(doc)}).{topic}"
 
 
 def _ref_for_index(ref: str) -> str:
@@ -1798,6 +1815,9 @@ def load_kb(path: str | Path) -> KnowledgeBase:
     # 1.5. Связи до чанкинга — чтобы short_ref допсоглашения уже был с родителем
     _link_addenda(documents)
     _link_regulations(documents)
+    for doc in documents.values():
+        if doc.doc_type == "law":
+            doc.topic = tax_topic(doc.text)
 
     # 2. Чанки
     chunks: list[Chunk] = []
