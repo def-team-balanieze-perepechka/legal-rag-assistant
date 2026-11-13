@@ -259,6 +259,9 @@ def run(name: str, data_dir: Path, out_root: Path, *, own_path: Path | None = No
         assistant = Assistant(load_kb(data_dir / "knowledge-base.zip"), LLMClient())
         if any(c.id not in _read_answers(run_dir / "answers.csv") for c in cases):
             assistant.build_index()
+            if not assistant.dense_ready and os.getenv("ALLOW_BM25") != "1":
+                raise SystemExit("Эмбеддинги недоступны (запущена ли Ollama с bge-m3?): ответы на одном BM25 "
+                                 "несравнимы с прежними прогонами. Запустите Ollama или задайте ALLOW_BM25=1.")
     kb = assistant.kb
     ours = answer_ours(cases, assistant, run_dir / "answers.csv")
     gen_settings = getattr(assistant.client, "s", None)
