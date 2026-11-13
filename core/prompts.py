@@ -158,7 +158,21 @@ ROUTER_USER = """КАТАЛОГ ДОКУМЕНТОВ (doc_id | название 
 ONLY_QUESTION = " Не добавляй факты и пункты сверх вопроса и тех, что есть во фрагментах."
 
 
+# Ориентир по длине
+WORD_LIMITS = {"fact": 45, "multi_doc": 60, "date_edition": 60, "old_law": 50, "illegal": 55}
+
+
 def plan_hint(plan, short_refs: list[str]) -> str:
+    """Подсказка по сценарию плюс лимит длины ответа (для fact — только лимит)."""
+    text = _scenario_hint(plan, short_refs)
+    limit = WORD_LIMITS.get(plan.scenario)
+    if limit:
+        text += (f" Не больше {limit} слов: только то, о чём спросили, и ссылка на пункт; "
+                 "не пересказывай соседние части нормы.")
+    return text.strip()
+
+
+def _scenario_hint(plan, short_refs: list[str]) -> str:
     """Подсказка по сценарию плана; пусто для fact. Пустые части опускаются."""
     s = plan.scenario
     if s == "false_premise":

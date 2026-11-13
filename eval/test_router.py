@@ -107,7 +107,7 @@ def _plan(scenario, **kw):
 
 
 def test_plan_hint_per_scenario():
-    assert prompts.plan_hint(_plan("fact"), []) == ""
+    assert "45 слов" in prompts.plan_hint(_plan("fact"), [])
     h = prompts.plan_hint(_plan("false_premise", claims=["НДС 20%"]), [])
     assert "НДС 20%" in h and "false_premise" in h
     h = prompts.plan_hint(_plan("date_edition", event_date=date(2024, 5, 1)), [])
@@ -500,3 +500,26 @@ def test_unknown_company_does_not_override_illegal_or_offtopic(kb):
     q = "Как скрыть сделку с ООО «Бета-Логистик» от налоговой?"
     assert _route_q(kb, q, scenario="illegal").scenario == "illegal"
     assert _route_q(kb, "Закажите пиццу в ООО «Додо»", scenario="offtopic").scenario == "offtopic"
+
+
+LIMITS = {"fact": 45, "multi_doc": 60, "date_edition": 60, "old_law": 50, "illegal": 55}
+
+
+@pytest.mark.parametrize("scenario,limit", LIMITS.items())
+def test_plan_hint_has_word_limit(scenario, limit):
+    h = prompts.plan_hint(_plan(scenario, event_date=date(2024, 5, 1)), ["регламент"])
+    assert f"Не больше {limit} слов" in h
+    assert "не пересказывай соседние" in h
+
+
+@pytest.mark.parametrize("scenario", ["false_premise", "not_in_kb", "offtopic"])
+def test_plan_hint_has_no_word_limit_elsewhere(scenario):
+    assert "слов:" not in prompts.plan_hint(_plan(scenario, claims=["c"]), [])
+
+
+def test_fact_hint_reaches_the_prompt(kb):
+    import generate as gen
+    chunks = kb.chunks[:2]
+    client = FakeClient(reply='{"status":"answer","answer":"ок","citations":[],"missing_info":""}')
+    gen.generate(client, kb, "вопрос?", [], chunks, plan=_plan("fact"))
+    assert "ПЛАН: Не больше 45 слов" in client.messages[0][-1]["content"]
