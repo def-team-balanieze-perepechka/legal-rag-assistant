@@ -6,6 +6,7 @@ import time
 import generate as gen
 from kb import load_kb
 from llm import LLMClient, env_int
+from router import route, router_enabled
 from search import Retriever
 
 _TURN_RE = re.compile(r"^\s*(Пользователь|Ассистент|User|Assistant)\s*:\s*", re.I | re.M)
@@ -59,12 +60,15 @@ class Assistant:
         last_assistant = next((t["content"] for t in reversed(history) if t["role"] == "assistant"), "")
         if last_assistant:
             context = f"{context} {last_assistant[:400]}"
-        hits = self.retriever.search(question, top_k=self.top_k, context=context, entity_context=user_context)
+        plan = route(self.client, self.kb, question, history) if router_enabled() else None
+        hits = self.retriever.search(question, top_k=self.top_k, context=context,
+                                     entity_context=user_context, plan=plan)
         chunks = [h.chunk for h in hits]
-        result = gen.generate(self.client, self.kb, question, history, chunks, allow_clarify)
+        result = gen.generate(self.client, self.kb, question, history, chunks, allow_clarify, plan=plan)
         result["steps"] = []
         result["debug"] = {
             "retrieved": [(h.chunk.chunk_id, round(h.score, 4), h.sources) for h in hits],
             "seconds": round(time.time() - t0, 2),
+            "plan": plan.as_debug() if plan else None,
         }
         return result

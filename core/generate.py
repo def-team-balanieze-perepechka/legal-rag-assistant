@@ -5,6 +5,7 @@ import os
 import re
 import sys
 
+import checks
 import prompts
 
 STATUSES = {"answer", "insufficient", "false_premise", "refuse_illegal", "offtopic", "clarify"}
@@ -33,13 +34,24 @@ def doc_label(doc) -> str:
     return label
 
 
-def format_fragments(chunks, kb) -> str:
+def edition_label(doc, event_date) -> str:
+    """
+    Метка редакции регламента относительно даты события;
+    для остальных документов пусто.
+    """
+    if event_date is None or doc.doc_type != "regulation":
+        return ""
+    active = (doc.valid_from is None or doc.valid_from <= event_date) and (doc.valid_to is None or event_date < doc.valid_to)
+    return " | действовала на дату события" if active else " | на дату события не действовала"
+
+
+def format_fragments(chunks, kb, event_date=None) -> str:
     if not chunks:
         return prompts.NO_FRAGMENTS
     parts = []
     for c in chunks:
         doc = kb.documents[c.doc_id]
-        head = f"[{c.chunk_id}] {doc_label(doc)} | {c.ref}"
+        head = f"[{c.chunk_id}] {doc_label(doc)} | {c.ref}{edition_label(doc, event_date)}"
         if c.section:
             head += f" | раздел «{c.section}»"
         notes = []
@@ -267,12 +279,30 @@ def _history_text(history: list[dict] | None) -> str:
     return " ".join(t.get("content", "") for t in history or [])
 
 
+def plan_extra(plan, kb, chunks=()) -> str:
+    """
+    Блок «ПЛАН» и строка об отсутствующих статьях после фрагментов;
+    без плана пусто (как в v2a).
+    """
+    if plan is None:
+        return ""
+    refs = [kb.documents[d].short_ref for d in plan.docs if d in kb.documents]
+    hint = prompts.plan_hint(plan, refs)
+    parts = ([f"ПЛАН: {hint}"] if hint else [])
+    note = checks.missing_article_note(chunks, kb)
+    if note:
+        parts.append(note)
+    return "\n\n" + "\n".join(parts) if parts else ""
+
+
 def generate(client, kb, question: str, history: list[dict] | None, chunks: list,
-             allow_clarify: bool = False) -> dict:
+             allow_clarify: bool = False, plan=None) -> dict:
     messages = [
         {"role": "system", "content": prompts.system_prompt(allow_clarify)},
         {"role": "user", "content": prompts.USER.format(
-            history=format_history(history), question=question, fragments=format_fragments(chunks, kb))},
+            history=format_history(history), question=question,
+            fragments=format_fragments(chunks, kb, plan.event_date if plan else None),
+            extra=plan_extra(plan, kb, chunks))},
     ]
     raw, obj, cut, llm_ok, llm_down = "", None, False, False, False
     limit = getattr(getattr(client, "s", None), "max_tokens", None) or DEFAULT_MAX_TOKENS
@@ -333,6 +363,9 @@ def generate(client, kb, question: str, history: list[dict] | None, chunks: list
 
     citations = build_citations(valid, kb)
     answer = drop_unknown_clause_refs(one_line(obj.get("answer", "")), chunks, _history_text(history))
+    if plan is not None:
+        answer = checks.drop_invented_articles(answer, status, chunks, kb)
+        answer = checks.drop_leaked_chunk_ids(answer, kb)
     # К отказу подпись не нужна: судья считает перечисленные пункты фактами, которых нет в эталоне
     if citations and status not in NO_SOURCE_STATUSES and not _REF_HINT_RE.search(answer):
         answer = f"{answer} {source_suffix(citations)}".strip()

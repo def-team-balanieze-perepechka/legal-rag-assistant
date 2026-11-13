@@ -14,6 +14,10 @@ CANDIDATES = 30          # Сколько возьмем из каждого р�
 RERANK_POOL = 24         # Сколько кандидатов отдаем реранкеру
 EMBED_BATCH = 32
 PINNED_DOC_MAX_CHUNKS = 25  # Документ подкладываем целиком, если он не длиннее этого
+PLAN_DOC_FULL_CHARS = 5000  # Документ плана целиком, если его текст не длиннее этого
+PLAN_DOC_TOP = 4            # Иначе — столько лучших фрагментов документа
+PLAN_DOC_MAX_CHUNKS = 20    # Всего из документов плана
+PLAN_DOC_SCENARIOS = ("multi_doc", "date_edition", "old_law", "illegal")
 
 _LAT2CYR = str.maketrans("abcehkmoptxy", "авсенкмортху")
 _NUMBER_RE = re.compile(r"(?<![\w])([a-zа-я]{1,3})\s*-?\s*(\d{1,4})\s*[/-]\s*(\d{2,4})(?![\w])", re.I)
@@ -172,8 +176,50 @@ class Retriever:
             return None
         return [(pool[i], s) for i, s in res if 0 <= i < len(pool)] or None
 
+    def _doc_top(self, idxs: list[int], queries: list[str], question: str) -> list[int]:
+        """
+        Лучшие PLAN_DOC_TOP фрагментов одного документа:
+        BM25 + эмбеддинги по запросам, RRF, реранк.
+        """
+        rankings: list[list[int]] = []
+        for q in queries:
+            tokens = tokenize(q)
+            if tokens:
+                scores = self.bm25.get_scores(tokens)
+                ranked = sorted(idxs, key=lambda i: -scores[i])
+                rankings.append([i for i in ranked if scores[i] > 0])
+            if self.vectors is not None and self.client is not None:
+                try:
+                    v = np.asarray(self.client.embed([q])[0], dtype=np.float32)
+                except Exception as exc:
+                    print(f"[search] эмбеддинг запроса плана не получен: {type(exc).__name__}", file=sys.stderr)
+                    continue
+                v /= max(float(np.linalg.norm(v)), 1e-12)
+                sims = self.vectors[idxs] @ v
+                rankings.append([idxs[j] for j in np.argsort(-sims)])
+        fused = self.rrf(rankings)
+        if not fused:
+            return list(idxs[:PLAN_DOC_TOP])
+        pool = sorted(fused, key=fused.get, reverse=True)[:RERANK_POOL]
+        reranked = self._rerank(question, pool)
+        order = [i for i, _ in sorted(reranked, key=lambda x: -x[1])] if reranked else pool
+        return order[:PLAN_DOC_TOP]
+
+    def _plan_doc_chunks(self, plan, question: str) -> list[int]:
+        out: list[int] = []
+        for doc_id in plan.docs:
+            doc = self.kb.documents.get(doc_id)
+            idxs = self.by_doc.get(doc_id, [])
+            if doc is None or not idxs:
+                continue
+            picked = list(idxs) if len(doc.text) <= PLAN_DOC_FULL_CHARS else self._doc_top(idxs, [question, *plan.queries], question)
+            for i in picked:
+                if i not in out and len(out) < PLAN_DOC_MAX_CHUNKS:
+                    out.append(i)
+        return out
+
     def search(self, query: str, top_k: int = 8, context: str = "",
-               entity_context: str | None = None) -> list[Hit]:
+               entity_context: str | None = None, plan=None) -> list[Hit]:
         """
         query — последняя реплика пользователя;
         context — предыдущие реплики диалога (для поиска);
@@ -184,11 +230,20 @@ class Retriever:
         full = f"{context}\n{query}".strip()
         bm25 = self._bm25_top(full)
         dense = self._dense_top(full)
-        fused = self.rrf([bm25, dense])
+        rankings = [bm25, dense]
         sources: dict[int, list[str]] = {}
         for name, ranking in (("bm25", bm25), ("dense", dense)):
             for i in ranking:
                 sources.setdefault(i, []).append(name)
+        # Запросы плана: свои BM25 и эмбеддинги, объединяются с основным через RRF
+        for pq in (plan.queries if plan else []):
+            extra = (self._bm25_top(pq), self._dense_top(pq))
+            rankings.extend(extra)
+            for name, ranking in zip(("bm25", "dense"), extra):
+                for i in ranking:
+                    if name not in sources.setdefault(i, []):
+                        sources[i].append(name)
+        fused = self.rrf(rankings)
 
         # Документы, явно названные в вопросе
         ent = self.entities.match(f"{entity_context}\n{query}" if entity_context is not None else full)
@@ -212,6 +267,13 @@ class Retriever:
             fused = {i: s for i, s in fused.items()
                      if self.chunks[i].doc_id in named
                      or self.kb.documents[self.chunks[i].doc_id].doc_type not in ("contract", "addendum")}
+
+        # Договор не назван, а план указывает закон: закон важнее договора
+        if plan and not named_docs:
+            types = {self.kb.documents[d].doc_type for d in plan.docs if d in self.kb.documents}
+            if "law" in types and not types & {"contract", "addendum"}:
+                fused = {i: s for i, s in fused.items()
+                         if self.kb.documents[self.chunks[i].doc_id].doc_type not in ("contract", "addendum")}
 
         # Назван вид налога — статьи о других налогах (тот же «Налоговые ставки»)
         # убираем по текущему вопросу; иначе — по прошлым репликам пользователя
@@ -244,8 +306,11 @@ class Retriever:
                 chosen.extend(same)
         for i in pinned:
             sources.setdefault(i, []).append("entity")
+        plan_idxs = self._plan_doc_chunks(plan, query) if plan and plan.scenario in PLAN_DOC_SCENARIOS else []
+        for i in plan_idxs:
+            sources.setdefault(i, []).append("plan")
         result: list[int] = []
-        for i in chosen + pinned:
+        for i in chosen + plan_idxs + pinned:
             if i not in result:
                 result.append(i)
         # Подкрепленные сущностью документы — в исходном порядке пунктов,
