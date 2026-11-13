@@ -1,41 +1,36 @@
+x-common: &common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: legal-assistant:local
+  env_file:
+    - path: .env
+      required: false
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  volumes:
+    - ./data:/data:ro
+  cpus: 8
+  mem_limit: 16g
+
 services:
   solution:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: legal-assistant:local
-    env_file:
-      - .env
+    <<: *common
     environment:
       DATA_DIR: /data
       SUBMISSION_PATH: /out/submission.csv
     volumes:
       - ./data:/data:ro
       - ./out:/out
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    cpus: 8
-    mem_limit: 16g
+    user: "${LOCAL_UID:-10001}:${LOCAL_GID:-10001}"
     command: ["python", "solution.py"]
 
   api:
     profiles: ["web"]
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: legal-assistant:local
-    env_file:
-      - .env
     environment:
       DATA_DIR: /data
-    volumes:
-      - ./data:/data:ro
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     ports:
       - "8000:8000"
-    cpus: 8
-    mem_limit: 16g
     command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
     healthcheck:
       test:

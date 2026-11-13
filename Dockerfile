@@ -20,5 +20,5 @@ RUN mkdir -p /data /out && chown -R app:app /app /data /out
 
 USER app
 
-EXPOSE 8000
+
 CMD ["python", "solution.py"]
