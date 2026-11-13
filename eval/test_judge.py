@@ -297,9 +297,10 @@ TWO = [_case("demo-1", question="Какая арендная плата по д�
 
 
 @needs_data
-def test_answer_ours_caches_by_file(tmp_path, kb):
+def test_answer_ours_caches_by_file(tmp_path, kb, monkeypatch):
     from assistant import Assistant
 
+    monkeypatch.setenv("ROUTER", "0")  # Тест про кэш ответов: один вызов LLM на вопрос
     a = Assistant(kb, FakeClient(_json_reply))
     path = tmp_path / "answers.csv"
     r1 = answer_ours(TWO, a, path)
@@ -561,3 +562,32 @@ def test_stub_scores_zero_without_judge(tmp_path, kb):
             judge=Judge(fj, out / "judge_cache.jsonl", "m"), baseline_runner=_base)
     assert fj.calls == 0 and m["match_rate"] == 0.0 and m["n"] == 2
     assert "заглушка" in (out / "t3" / "report.md").read_text(encoding="utf-8")
+
+
+def test_run_refuses_to_judge_bm25_only_answers(tmp_path, monkeypatch):
+    """Без эмбеддингов (Ollama не запущена) ответы агента не сравнимы"""
+    import assistant as assistant_module
+    import judge
+    import kb as kb_module
+    import llm
+
+    class Stub:
+        def __init__(self, *a, **k):
+            self.dense_ready = True
+
+        def build_index(self):
+            self.dense_ready = False
+
+    monkeypatch.setattr(assistant_module, "Assistant", Stub)
+    monkeypatch.setattr(kb_module, "load_kb", lambda p: None)
+    monkeypatch.setattr(llm, "LLMClient", lambda: None)
+    monkeypatch.delenv("ALLOW_BM25", raising=False)
+    data = Path(__file__).resolve().parent.parent / "data"
+    if not (data / "knowledge-base.zip").exists():
+        pytest.skip("нет data/knowledge-base.zip")
+    with pytest.raises(SystemExit):
+        judge.run("t", data, tmp_path, ids=["own-1"])
+    monkeypatch.setenv("ALLOW_BM25", "1")  # Явное разрешение отключает защиту
+    with pytest.raises(Exception) as exc:
+        judge.run("t", data, tmp_path, ids=["own-1"])
+    assert not isinstance(exc.value, SystemExit)
