@@ -20,7 +20,7 @@ import httpx
 
 # Должен быть БОЛЬШЕ серверного CHAT_TIMEOUT (180 с), иначе клиент оборвёт
 # соединение раньше, чем сервер успеет вернуть осмысленный 504.
-DEFAULT_TIMEOUT = 200.0
+DEFAULT_TIMEOUT = API_URL = float(os.getenv("LLM_TIMEOUT", 300.0)) + 10.0
 
 
 class LegalAssistantError(RuntimeError):
