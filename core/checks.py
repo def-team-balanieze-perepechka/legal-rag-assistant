@@ -4,6 +4,7 @@ import re
 import sys
 
 import generate as gen
+import prompts
 
 NO_SOURCE = {"insufficient", "offtopic", "refuse_illegal"}
 OTHER_ACT_WINDOW = 40
@@ -81,8 +82,14 @@ def drop_invented_articles(answer: str, status: str, chunks, kb) -> str:
     for c in chunks:
         known.update(n for n, _ in _refs(c.text or ""))
     sentences = _split_sentences(answer)
+    if not any(s.strip() for s in sentences):
+        return answer
     kept = [s for s in sentences if all(n in known for n, _ in _refs(s))]
-    if not kept or len(kept) == len(sentences):
+    if not kept:  # Выдумана каждая ссылка: оставлять выдумку нельзя, говорим нейтрально
+        print("[checks] все предложения со ссылками на отсутствующие статьи, "
+              "ответ заменен нейтральным", file=sys.stderr)
+        return prompts.NEUTRAL_REFUSAL[status]
+    if len(kept) == len(sentences):
         return answer
     print(f"[checks] убраны предложения с выдуманными статьями: {len(sentences) - len(kept)}", file=sys.stderr)
     return " ".join(kept)
