@@ -61,8 +61,6 @@ HTTP-бекенд юридического ассистента: FastAPI пов�
 
 ## Запуск
 
-## Запуск
-
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # заполнить LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
