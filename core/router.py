@@ -16,7 +16,10 @@ MAX_DOCS = 4
 MAX_QUERIES = 3
 MAX_QUERY_CHARS = 200
 MAX_CLAIMS = 3
-ROUTER_MAX_TOKENS = 512
+# JSON плана — 100–200 токенов, но модели с рассуждениями тратят лимит на <think>: берём запас
+# и один раз повторяем с удвоенным лимитом, если ответ оборван по длине
+ROUTER_MAX_TOKENS = 2048
+ROUTER_RETRY_TOKENS = 4096
 
 
 @dataclass
@@ -98,21 +101,24 @@ def parse_plan(raw: str, doc_ids: set[str]) -> Plan | None:
 
 
 def route(client, kb, question: str, history: list[dict] | None) -> Plan | None:
-    messages = [
-        {"role": "system", "content": prompts.ROUTER_SYSTEM},
-        {"role": "user", "content": prompts.ROUTER_USER.format(
-            catalog=build_catalog(kb), history=gen.format_history(history), question=question)},
-    ]
-    try:
-        raw = client.chat(messages, max_tokens=ROUTER_MAX_TOKENS)
-    except Exception as exc:
-        print(f"[router] вызов не удался: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return None
-    plan = parse_plan(raw or "", set(kb.documents))
-    if plan is None:
-        print("[router] ответ не разобран, идём путём v2a", file=sys.stderr)
-        return None
-    return adjust_plan(plan, kb, question)
+    user = prompts.ROUTER_USER.format(
+        catalog=build_catalog(kb), history=gen.format_history(history), question=question)
+    if os.getenv("LLM_NO_THINK") == "1":  # Как в запасном вызове: без рассуждений
+        user += prompts.NO_THINK
+    messages = [{"role": "system", "content": prompts.ROUTER_SYSTEM}, {"role": "user", "content": user}]
+    for limit in (ROUTER_MAX_TOKENS, ROUTER_RETRY_TOKENS):
+        try:
+            raw = client.chat(messages, max_tokens=limit)
+        except Exception as exc:
+            print(f"[router] вызов не удался: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return None
+        plan = parse_plan(raw or "", set(kb.documents))
+        if plan is not None:
+            return adjust_plan(plan, kb, question)
+        if getattr(raw, "finish_reason", None) != "length":
+            break
+    print("[router] ответ не разобран, идём путём v2a", file=sys.stderr)
+    return None
 
 
 _ORG_RE = re.compile(r"(?:ООО|АО|ПАО|ЗАО|ИП)\s*[«\"]([^»\"]+)[»\"]")
@@ -128,12 +134,19 @@ def names_unknown_company(question: str, kb) -> bool:
     return not kb.match_counterparties(question) and not kb.resolve_contract(question)
 
 
+def names_known_entity(question: str, kb) -> bool:
+    """В вопросе назван договор (по номеру) или контрагент, которые есть в базе."""
+    return bool(kb.match_counterparties(question) or kb.resolve_contract(question))
+
+
 def adjust_plan(plan: Plan, kb, question: str = "") -> Plan:
     """
     Правила поверх ответа модели: утверждения пользователя означают проверку предпосылки,
     а прошлое значение закона — не «редакция на дату», потому что законы в базе только действующие;
     названная организация, которой нет в базе, — это вопрос о том, чего в базе нет.
     """
+    if plan.scenario == "not_in_kb" and names_known_entity(question, kb):
+        plan.scenario = "fact"
     if plan.scenario in _CONTENT_SCENARIOS and names_unknown_company(question, kb):
         plan.scenario = "not_in_kb"
         plan.docs = []
