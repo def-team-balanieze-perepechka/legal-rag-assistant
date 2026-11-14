@@ -259,9 +259,15 @@ async def chat(req: ChatRequest, request: Request) -> ChatResponse:
         raise HTTPException(500, f"ошибка ассистента: {type(exc).__name__}: {exc}") from exc
 
     if result.get("status") == "error":
-        # ядро глотает ошибки LLM и отдаёт заглушку со статусом error; контракт обещает HTTP-код
-        raise HTTPException(502, "LLM недоступна или не вернула корректный ответ")
-
+        import json
+        print(
+            f"[api] /chat FAIL: {json.dumps(result.get('debug'), ensure_ascii=False, default=str)}",
+            flush=True,
+        )
+        raise HTTPException(
+            502,
+            f"LLM недоступна или не вернула корректный ответ: {result.get('debug') or 'no debug'}",
+        )
     def _full_text(c: dict) -> str:
         try:
             return assistant.kb.get_chunk(c.get("chunk_id", "")).text
