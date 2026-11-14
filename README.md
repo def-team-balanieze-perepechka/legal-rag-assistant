@@ -57,6 +57,7 @@ python eval/judge.py --name v1                 # полный прогон: аг
 - Ограничение: наш судья не совпадает с судьей платформы.
 
 
+
 ## Запуск через Docker
 
 Проект поддерживает два режима работы в Docker:
@@ -210,3 +211,42 @@ Ollama должна слушать не только `127.0.0.1`, иначе и�
 - **Ответы на локальной модели хуже, чем на платформенной.** `qwen3:4b` — компромисс по размеру; на платформе используется DeepSeek V4.1 Flash.
 - **Права на `out/` (Linux/WSL).** Контейнер работает от пользователя `LOCAL_UID:LOCAL_GID`. Если не делали `export LOCAL_UID=$(id -u)`, прогон может упасть с `PermissionError`.
 
+
+# Legal RAG Assistant — API
+
+HTTP-бекенд юридического ассистента: FastAPI поверх `core/` (RAG по нормативной базе знаний).
+
+## Запуск
+
+## Запуск
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env          # заполнить LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
+uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+
+Сервис: http://localhost:8000 
+Swagger: http://localhost:8000/docs
+
+При старте загружается база знаний из DATA_DIR/knowledge-base.zip (или KB_PATH).
+Пока идёт загрузка, /health отдаёт 503, после — 200.
+
+
+# Legal RAG Assistant — API
+
+HTTP-бекенд юридического ассистента: FastAPI поверх `core/` (RAG по нормативной базе знаний).
+
+## Запуск
+
+## Запуск
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env          # заполнить LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
+uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+
+Сервис: http://localhost:8000 
+Swagger: http://localhost:8000/docs
+
+При старте загружается база знаний из DATA_DIR/knowledge-base.zip (или KB_PATH).
+Пока идёт загрузка, /health отдаёт 503, после — 200.
