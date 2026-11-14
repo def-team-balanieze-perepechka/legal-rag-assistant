@@ -12,7 +12,7 @@ import streamlit as st
 
 from api.client import LegalAssistantClient, LegalAssistantError
 
-API_URL = os.getenv("API_URL", "http://localhost:8000")
+API_URL = os.getenv("API_URL", "http://api:8000")
 # Сколько последних реплик отправлять в API. Ядро строит поисковый контекст из ВСЕХ
 # реплик пользователя в истории, поэтому длинный диалог «размывает» поиск и раздувает промпт.
 HISTORY_LIMIT = int(os.getenv("UI_HISTORY_LIMIT", "10"))
@@ -32,7 +32,7 @@ def wait_until_ready() -> None:
         st.session_state.api_ready = True
         return
     st.warning("⏳ Сервис загружает базу знаний, подождите…")
-    st.caption(f"API: {API_URL}")
+    st.caption(f"API: http://localhost:8001")
     time.sleep(5)
     st.rerun()
 
@@ -72,17 +72,20 @@ def ask(messages: list[dict]) -> dict:
 
 
 def describe_error(exc: LegalAssistantError) -> tuple[str, bool]:
-    """-> (текст для пользователя, можно ли повторить)."""
     code = exc.status_code
     if code == 400:
         return f"Некорректный запрос: {exc.detail}", False
     if code == 422:
-        print(f"[ui] 422 от API (баг формата запроса): {exc.detail}", file=sys.stderr)
+        print(f"[ui] 422 от API: {exc.detail}", file=sys.stderr)
         return "Ошибка интерфейса: неверный формат запроса. Подробности в консоли.", False
     if code == 503:
         return "Сервис ещё загружает базу знаний. Повторите через 10 секунд.", True
     if code == 504:
         return "Ассистент не успел ответить (таймаут). Повторите или упростите вопрос.", True
+    if code == 502:
+        # Ядро вернуло status="error": LLM недоступна или не смогла ответить JSON.
+        # detail содержит debug от api — показываем его, чтобы можно было отладить.
+        return f"Ассистент не смог ответить: {exc.detail}", True
     if code is None:
         return f"Нет связи с API ({API_URL}). Проверьте, что бэкенд запущен.", True
-    return "Сервис временно недоступен (ошибка модели или сети). Повторите позже.", True
+    return f"Сервис вернул ошибку {code}: {exc.detail}", True
