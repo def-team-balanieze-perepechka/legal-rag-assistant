@@ -71,9 +71,27 @@ class Citation(BaseModel):
     title: str
     short_ref: str
     ref: str
-    quote: str
+    quote: str                    # первые 400 символов фрагмента (превью)
+    text: str = ""                # полный текст фрагмента
+    start: int | None = None      # смещения фрагмента в тексте документа: doc.text[start:end]
+    end: int | None = None
     edition: str | None = None
     status: str | None = None
+
+
+class DocumentFull(BaseModel):
+    doc_id: str
+    doc_type: str
+    title: str
+    short_ref: str
+    number: str | None = None
+    date: str | None = None
+    edition: str | None = None
+    status: str
+    valid_from: str | None = None
+    valid_to: str | None = None
+    source_url: str | None = None
+    text: str
 
 
 class ChatResponse(BaseModel):
@@ -178,11 +196,29 @@ def list_documents(request: Request) -> list[dict]:
             "number": d.number,
             "date": d.date.isoformat() if d.date else None,
             "status": d.status,
+            "edition": d.edition,
             "valid_from": d.valid_from.isoformat() if d.valid_from else None,
             "valid_to": d.valid_to.isoformat() if d.valid_to else None,
         }
         for d in a.kb.documents.values()
     ]
+
+
+@app.get("/documents/{doc_id:path}", response_model=DocumentFull, dependencies=[Depends(require_ready)])
+def get_document(doc_id: str, request: Request) -> DocumentFull:
+    """Полный текст документа — для просмотра в UI (ТЗ п.06: просмотр документов и фрагментов)."""
+    a: Assistant = request.app.state.assistant
+    d = a.kb.documents.get(doc_id)
+    if d is None:
+        raise HTTPException(404, f"документ не найден: {doc_id}")
+    return DocumentFull(
+        doc_id=d.doc_id, doc_type=d.doc_type, title=d.title, short_ref=d.short_ref,
+        number=d.number, date=d.date.isoformat() if d.date else None, edition=d.edition,
+        status=d.status,
+        valid_from=d.valid_from.isoformat() if d.valid_from else None,
+        valid_to=d.valid_to.isoformat() if d.valid_to else None,
+        source_url=d.source_url, text=d.text,
+    )
 
 
 def _extract_question(req: ChatRequest) -> tuple[str, list[dict] | None]:
@@ -197,7 +233,7 @@ def _extract_question(req: ChatRequest) -> tuple[str, list[dict] | None]:
         msgs = [m.model_dump() for m in req.messages]
         if msgs[-1]["role"] != "user":
             raise HTTPException(400, "последнее сообщение в messages должно быть от user")
-        return _check(msgs[-1]["content"]), (msgs[:-1] or None)
+        return _check(msgs[-1]["content"]), msgs[:-1]   # [] (не None): иначе ядро разберёт текст как диалог
     if req.question and req.history:
         return _check(req.question), [m.model_dump() for m in req.history]
     if req.question:
@@ -222,6 +258,16 @@ async def chat(req: ChatRequest, request: Request) -> ChatResponse:
     except Exception as exc:
         raise HTTPException(500, f"ошибка ассистента: {type(exc).__name__}: {exc}") from exc
 
+    if result.get("status") == "error":
+        # ядро глотает ошибки LLM и отдаёт заглушку со статусом error; контракт обещает HTTP-код
+        raise HTTPException(502, "LLM недоступна или не вернула корректный ответ")
+
+    def _full_text(c: dict) -> str:
+        try:
+            return assistant.kb.get_chunk(c.get("chunk_id", "")).text
+        except Exception:
+            return c.get("quote", "")
+
     citations = [
         Citation(
             chunk_id=c.get("chunk_id", ""),
@@ -230,6 +276,9 @@ async def chat(req: ChatRequest, request: Request) -> ChatResponse:
             short_ref=c.get("short_ref", ""),
             ref=c.get("ref", ""),
             quote=c.get("quote", ""),
+            text=_full_text(c),
+            start=c.get("start"),
+            end=c.get("end"),
             edition=c.get("edition"),
             status=c.get("status"),
         )
