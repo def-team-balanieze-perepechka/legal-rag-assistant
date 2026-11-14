@@ -4,6 +4,7 @@ import re
 import time
 
 import generate as gen
+import prompts
 from kb import load_kb
 from llm import LLMClient, env_int
 from router import route, router_enabled
@@ -51,10 +52,19 @@ class Assistant:
     def build_index(self) -> None:
         self.dense_ready = self.retriever.build_dense()
 
+    @staticmethod
+    def _empty_answer(allow_clarify: bool, t0: float) -> dict:
+        """Вопроса нет (пусто, пробелы, «???»): отвечаем без поиска и вызовов LLM."""
+        return {"status": "clarify" if allow_clarify else "offtopic", "answer": prompts.EMPTY_QUESTION,
+                "citations": [], "missing_info": None, "dropped_citations": [], "raw_ok": True, "steps": [],
+                "debug": {"retrieved": [], "seconds": round(time.time() - t0, 2), "plan": None}}
+
     def answer(self, question: str, history: list[dict] | None = None, allow_clarify: bool = False) -> dict:
         t0 = time.time()
         if history is None:
             question, history = parse_dialog(question)
+        if not re.search(r"\w", question or ""):
+            return self._empty_answer(allow_clarify, t0)
         user_context = " ".join(t["content"] for t in history if t["role"] == "user")
         context = user_context
         last_assistant = next((t["content"] for t in reversed(history) if t["role"] == "assistant"), "")
