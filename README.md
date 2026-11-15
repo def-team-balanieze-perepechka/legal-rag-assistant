@@ -223,7 +223,7 @@ HTTP-бекенд юридического ассистента: FastAPI пов�
 pip install -r requirements-api.txt
 cp .env.example .env          # заполнить LLM_BASE_URL, LLM_API_KEY, LLM_MODEL, DATA_DIR
 uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
-
+```
 Сервис: http://localhost:8000 
 Swagger: http://localhost:8000/docs
 
