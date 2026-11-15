@@ -1,0 +1,23 @@
+.stChatMessage:has([data-testid="stChatMessageAvatarUser"]) {
+    display: flex;
+    flex-direction: row-reverse;
+    align-items: flex-end;
+}
+
+.stChatMessage:has([data-testid="stChatMessageAvatarUser"]) [data-testid="stMarkdownContainer"] {
+    margin-left: auto;
+    text-align: right;
+}
+
+/* Скрывает иконки аватаров у сообщений */
+[data-testid="stChatMessageAvatarUser"],
+[data-testid="stChatMessageAvatarAssistant"],
+[data-testid="stChatMessageAvatarCustom"] {
+    display: none !important;
+}
+/* Сообщения прижаты к низу окна чата фиксированной высоты.
+   margin-top:auto (а не justify-content:flex-end) — чтобы при переполнении верх истории оставался доступен для прокрутки. */
+.st-key-chat_box::before {
+    content: "";
+    margin-top: auto;
+}
