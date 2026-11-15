@@ -1,36 +1,50 @@
 x-common: &common
-  build:
-    context: .
-    dockerfile: Dockerfile
-  image: legal-assistant:local
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+# .env с ключом LLM нужен только solution и api; UI его не получает
+x-env: &env
   env_file:
     - path: .env
       required: false
-  extra_hosts:
-    - "host.docker.internal:host-gateway"
-  volumes:
-    - ./data:/data:ro
-  cpus: 8
-  mem_limit: 16g
+
 
 services:
   solution:
-    <<: *common
+    profiles: ["batch"]
+    <<: [*common, *env]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        REQS: requirements.txt
+    image: legal-assistant-solution:local
     environment:
       DATA_DIR: /data
       SUBMISSION_PATH: /out/submission.csv
+    cpus: 8
+    mem_limit: 16g
     volumes:
       - ./data:/data:ro
       - ./out:/out
     user: "${LOCAL_UID:-10001}:${LOCAL_GID:-10001}"
     command: ["python", "solution.py"]
 
+
   api:
-    profiles: ["web"]
-    environment:
-      DATA_DIR: /data
+    <<: [*common, *env]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        REQS: requirements-api.txt
+    image: legal-assistant-api:local
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8001:8000"   # только с этой машины: у API нет авторизации, а за ним платный LLM-ключ
+    environment:
+      CHAT_TIMEOUT: ${CHAT_TIMEOUT:-180}   # сервер обрывает запрос на этом значении; клиент UI ждёт на 30 с дольше
+    volumes:
+      - ./data:/data:ro
     command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
     healthcheck:
       test:
@@ -40,7 +54,28 @@ services:
           "-c",
           "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"
         ]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-      start_period: 20s
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  ui:
+    <<: *common
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        REQS: requirements-ui.txt
+    image: legal-assistant-ui:local
+    command: ["streamlit", "run", "ui/app.py",
+            "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true"]
+    environment:
+      API_URL: http://api:8000
+      CHAT_TIMEOUT: ${CHAT_TIMEOUT:-180}
+      STREAMLIT_CLIENT_SHOW_ERROR_DETAILS: "none"        # пользователь не видит traceback; полный — в логах контейнера
+      STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
+    ports:
+      - "8000:8501"
+    depends_on:
+      api:
+        condition: service_healthy

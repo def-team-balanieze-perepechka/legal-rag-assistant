@@ -10,19 +10,19 @@ WORKDIR /app
 RUN groupadd --gid 10001 app \
  && useradd --uid 10001 --gid app --create-home --shell /usr/sbin/nologin app
 
-COPY requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+ARG REQS=requirements.txt
 
-COPY solution.py ./solution.py
-COPY core ./core
+COPY --chown=app:app requirements.txt requirements-api.txt requirements-ui.txt ./
 
-RUN mkdir -p /data /out && chown -R app:app /app /data /out
+RUN pip install --no-cache-dir -r "${REQS}"
+
+COPY --chown=app:app solution.py ./
+COPY --chown=app:app core ./core
+COPY --chown=app:app api ./api
+COPY --chown=app:app ui ./ui
 
 USER app
 
-<<<<<<< HEAD
+EXPOSE 8000 8501
 
-=======
-EXPOSE 8000
->>>>>>> 6e0c8d1 (feat(docker): containerize solution.py and scaffold api service)
 CMD ["python", "solution.py"]
