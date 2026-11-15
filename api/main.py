@@ -264,10 +264,8 @@ async def chat(req: ChatRequest, request: Request) -> ChatResponse:
             f"[api] /chat FAIL: {json.dumps(result.get('debug'), ensure_ascii=False, default=str)}",
             flush=True,
         )
-        raise HTTPException(
-            502,
-            f"LLM недоступна или не вернула корректный ответ: {result.get('debug') or 'no debug'}",
-        )
+        # в detail — без debug: там id чанков и оценки, а причины сбоя нет (она в логе: «[generate] LLM недоступна: …»)
+        raise HTTPException(502, "LLM недоступна или не вернула корректный ответ (причина — в логах api)")
     def _full_text(c: dict) -> str:
         try:
             return assistant.kb.get_chunk(c.get("chunk_id", "")).text
