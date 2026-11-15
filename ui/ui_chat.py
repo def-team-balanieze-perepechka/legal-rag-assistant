@@ -25,7 +25,9 @@ session_state.job = {"future": Future, "t0": float, "result": None | {...}}
 Если запрос завершился ошибкой, неудавшийся вопрос остаётся в чате только до следующего вопроса:
 он нужен для «Повторить». Новый вопрос убирает его из чата и из истории, уходящей в API.
 """
+import os
 import re
+import threading
 import time
 
 import streamlit as st
@@ -37,6 +39,9 @@ GREETING = (
     "Здравствуйте! Я отвечаю на вопросы по документам базы знаний компании "
     "и ссылаюсь на конкретные пункты. Задайте вопрос."
 )
+
+# сколько секунд страница может не опрашивать запрос, прежде чем он будет считаться брошенным (закрыта вкладка / F5)
+WATCHDOG_TTL = float(os.getenv("UI_WATCHDOG_TTL", "30"))
 
 # status -> (тип плашки Streamlit, текст)
 STATUS_NOTES = {
@@ -55,10 +60,11 @@ def _open_sources(idx: int) -> None:
 
 def _start_job() -> None:
     """Отправляет текущую историю в фон. Старый незавершённый запрос (если был) просто теряет значение."""
+    job = {"future": submit_chat(st.session_state.messages), "t0": time.time(), "seen": time.time(), "result": None}
     st.session_state.pending = False
     st.session_state.last_error = None
-    st.session_state.job = {"future": submit_chat(st.session_state.messages), "t0": time.time(), "result": None}
-
+    st.session_state.job = job
+    threading.Thread(target=_watchdog, args=(job,), daemon=True).start()
 
 def _settle_job() -> None:
     """
@@ -152,6 +158,8 @@ def _consume(fut) -> dict:
     """Забирает результат завершённого Future. Любая ошибка -> сообщение пользователю, не traceback."""
     try:
         data = fut.result()
+        if data.get("status") == "error": 
+            raise LegalAssistantError("ядро не смогло сформировать ответ", status_code=502)
         msg = {
             "role": "assistant",
             "content": data["answer"],
@@ -187,6 +195,8 @@ def _job_view() -> None:
         if st.session_state.get("last_error"):
             _render_error(error_slot)
         return
+    
+    job["seen"] = time.time()
 
     fut = job["future"]
     if not fut.done():
@@ -217,18 +227,33 @@ def _input_area() -> None:
     """Поле ввода + переключатель. Заблокировано, пока запрос не завершится любым исходом."""
     job = st.session_state.get("job")
     busy = job is not None and not job["future"].done()
-
+    if job:
+        job["seen"] = time.time()
+        
     user_input = st.chat_input("Напишите вопрос…", disabled=busy)
-    st.toggle(
-        "Уточняющие вопросы",
-        key="allow_clarify",
-        help="Если из вопроса неясно, о каком договоре или периоде речь, "
-             "ассистент сначала уточнит, а потом ответит.",
-    )
+    
+    # Создаем две колонки: левая (широкая) для тумблера, правая (узкая) для кнопки
+    col1, col2 = st.columns([4, 1], vertical_alignment="center")
+    
+    with col1:
+        st.toggle(
+            "Уточняющие вопросы",
+            key="allow_clarify",
+            help="Если из вопроса неясно, о каком договоре или периоде речь, "
+                 "ассистент сначала уточнит, а потом ответит.",
+        )
+        
+    with col2:
+        if busy:
+            # width="stretch" (или use_container_width=True в старых версиях) 
+            # растянет кнопку на всю ширину правой колонки
+            if st.button("⏹ Остановить", key="stop_btn", width="stretch"):
+                _stop_job()
+                st.rerun()
+                
     if user_input and user_input.strip():
         if _submit_question(user_input.strip()):
-            st.rerun()                                # полный rerun: запрос запускается и рисуется в основном скрипте
-
+            st.rerun()
 
 def render_chat_content(chat_col) -> None:
     with chat_col:
@@ -257,3 +282,22 @@ def render_chat_content(chat_col) -> None:
                 _render_message(idx, msg)
 
             st.fragment(_job_view, run_every=poll)()
+
+
+def _stop_job() -> None:
+    job = st.session_state.get("job")
+    if job is not None:
+        job["future"].cancel()
+    st.session_state.job = None
+    st.session_state.last_error = None
+    msgs = st.session_state.messages
+    if msgs and msgs[-1]["role"] == "user":
+        msgs.pop()          # остановленный вопрос не остаётся в чате и в истории
+
+
+def _watchdog(job: dict) -> None:
+    while not job["future"].done():
+        if time.time() - job["seen"] > WATCHDOG_TTL:
+            job["future"].cancel()
+            return
+        time.sleep(1.0)
