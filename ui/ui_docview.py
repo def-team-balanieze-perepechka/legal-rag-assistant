@@ -31,7 +31,7 @@ def _to_html(text: str, start: int | None, end: int | None) -> str:
 def _dialog(doc_id: str, start: int | None, end: int | None) -> None:
     doc = load_document(doc_id)
     if doc is None:
-        st.error("Не удалось загрузить документ. Проверьте, что API доступен.")
+        st.error("Не удалось открыть документ. Попробуйте позже.")
         return
 
     st.subheader(doc["short_ref"])
