@@ -18,7 +18,7 @@ st.set_page_config(
 )
 
 from styles.loader import inject_css      # noqa: E402
-from ui_api import wait_until_ready       # noqa: E402
+from ui_api import GENERIC_ERROR, log_error, wait_until_ready   # noqa: E402
 from ui_chat import render_chat_content   # noqa: E402
 from ui_docview import show_pending_document  # noqa: E402
 from ui_refpanel import render_reference_panel  # noqa: E402
@@ -28,19 +28,25 @@ inject_css()
 
 # --- состояние (один диалог; бэкенд stateless) ---
 st.session_state.setdefault("messages", [])       # история диалога
+st.session_state.setdefault("job", None)       # фоновый запрос к API (см. ui_chat)
 st.session_state.setdefault("pending", False)     # ждём ответ API на последнее user-сообщение
 st.session_state.setdefault("last_error", None)   # {"text": str, "retryable": bool}
 st.session_state.setdefault("selected_msg", None) # индекс ответа, чьи источники открыты справа
 
-wait_until_ready()
-render_sidebar()
+wait_until_ready()   # st.rerun()/st.stop() внутри — не Exception, а ScriptControlException, под try ниже не попадают
 
-if st.session_state.selected_msg is not None:
-    _, chat_col, panel_col = st.columns([0.3, 2, 1.5], gap="large")
-else:
-    _, chat_col, _ = st.columns([1, 2, 1], gap="large")
-    panel_col = None
+try:
+    render_sidebar()
 
-render_chat_content(chat_col)
-render_reference_panel(panel_col)
-show_pending_document()   # диалог просмотра документа (если запрошен кнопкой)
+    if st.session_state.selected_msg is not None:
+        _, chat_col, panel_col = st.columns([0.3, 2, 1.5], gap="large")
+    else:
+        _, chat_col, _ = st.columns([1, 2, 1], gap="large")
+        panel_col = None
+
+    render_chat_content(chat_col)
+    render_reference_panel(panel_col)
+    show_pending_document()   # диалог просмотра документа (если запрошен кнопкой)
+except Exception:
+    log_error("необработанная ошибка интерфейса")
+    st.error(GENERIC_ERROR)
