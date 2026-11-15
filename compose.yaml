@@ -71,7 +71,7 @@ services:
             "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true"]
     environment:
       API_URL: http://api:8000
-      CHAT_TIMEOUT: ${CHAT_TIMEOUT:-180}
+      CHAT_TIMEOUT: ${CHAT_TIMEOUT:-210}
       STREAMLIT_CLIENT_SHOW_ERROR_DETAILS: "none"        # пользователь не видит traceback; полный — в логах контейнера
       STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
     ports:
