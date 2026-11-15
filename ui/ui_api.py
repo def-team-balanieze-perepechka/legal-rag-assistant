@@ -98,12 +98,9 @@ def submit_chat(messages: list[dict]) -> Future:
     session_state и клиент читаются здесь, а в поток уходят только готовые данные.
     Благодаря этому скрипт не стоит в ожидании ответа, и остальные клики (документы, источники) обрабатываются сразу.
     """
-    return get_executor().submit(
-        _chat_call,
-        get_client(),
-        build_payload(messages),
-        bool(st.session_state.get("allow_clarify", False)),
-    )
+    return get_client().chat_async(
+        messages=build_payload(messages),
+        allow_clarify=bool(st.session_state.get("allow_clarify", False)))
 
 
 def describe_error(exc: LegalAssistantError) -> tuple[str, bool]:

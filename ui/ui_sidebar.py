@@ -16,6 +16,9 @@ DOC_TYPE_TITLES = {
 def _reset_dialog() -> None:
     st.session_state.messages = []
     st.session_state.pending = False
+    job = st.session_state.get("job")
+    if job:
+        job["future"].cancel()
     st.session_state.job = None
     st.session_state.last_error = None
     st.session_state.selected_msg = None
