@@ -42,7 +42,7 @@ services:
     ports:
       - "127.0.0.1:8001:8000"   # только с этой машины: у API нет авторизации, а за ним платный LLM-ключ
     environment:
-      CHAT_TIMEOUT: ${CHAT_TIMEOUT:-180}   # сервер обрывает запрос на этом значении; клиент UI ждёт на 30 с дольше
+      CHAT_TIMEOUT: ${CHAT_TIMEOUT:-270}   # сервер обрывает запрос на этом значении; клиент UI ждёт на 30 с дольше
     volumes:
       - ./data:/data:ro
     command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
@@ -71,7 +71,7 @@ services:
             "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true"]
     environment:
       API_URL: http://api:8000
-      CHAT_TIMEOUT: ${CHAT_TIMEOUT:-210}
+      CHAT_TIMEOUT: ${CHAT_TIMEOUT:-300}
       STREAMLIT_CLIENT_SHOW_ERROR_DETAILS: "none"        # пользователь не видит traceback; полный — в логах контейнера
       STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
     ports:
