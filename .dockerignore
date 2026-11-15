@@ -1,0 +1,14 @@
+.env
+.env.*
+.venv/
+.git/
+.idea/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+data/
+out/
+dist/
+docs/
+.claude/
+CLAUDE.local.md
