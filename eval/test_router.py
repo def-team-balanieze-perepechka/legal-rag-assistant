@@ -78,7 +78,7 @@ def test_route_returns_plan_and_sends_history_and_catalog(kb):
     client = FakeClient(reply=plan_json(docs=["nk_164"]))
     plan = route(client, kb, "вопрос", [{"role": "user", "content": "прошлая реплика"}])
     assert plan.docs == ["nk_164"]
-    assert client.max_tokens == [512]
+    assert client.max_tokens == [2048]
     content = client.messages[0][-1]["content"]
     assert "прошлая реплика" in content and "вопрос" in content and "nk_164 | " in content
 
@@ -309,9 +309,23 @@ def test_invented_article_kept_if_in_kb_or_fragments(kb):
     assert drop_invented_articles(text, "insufficient", chunks, kb) == text
 
 
-def test_single_sentence_not_deleted(kb):
-    text = "Согласно ст. 260 это запрещено."
-    assert drop_invented_articles(text, "insufficient", [], kb) == text
+@pytest.mark.parametrize("status,expected", [
+    ("insufficient", "В базе знаний нет сведений для ответа на этот вопрос."),
+    ("refuse_illegal", "Я не могу помочь с этим запросом."),
+    ("offtopic", "Я отвечаю только на вопросы по базе знаний юридического отдела."),
+])
+def test_all_sentences_invented_gives_neutral_refusal(kb, status, expected):
+    text = "Согласно ст. 260 это запрещено. По ст. 261 тоже нельзя."
+    assert drop_invented_articles(text, status, [], kb) == expected
+
+
+def test_single_invented_sentence_is_replaced_not_kept(kb):
+    out = drop_invented_articles("Согласно ст. 260 это запрещено.", "insufficient", [], kb)
+    assert "260" not in out and out
+
+
+def test_empty_answer_is_left_alone(kb):
+    assert drop_invented_articles("", "insufficient", [], kb) == ""
 
 
 def test_abbreviation_does_not_split_sentence(kb):
@@ -500,3 +514,93 @@ def test_unknown_company_does_not_override_illegal_or_offtopic(kb):
     q = "Как скрыть сделку с ООО «Бета-Логистик» от налоговой?"
     assert _route_q(kb, q, scenario="illegal").scenario == "illegal"
     assert _route_q(kb, "Закажите пиццу в ООО «Додо»", scenario="offtopic").scenario == "offtopic"
+
+
+from llm import Reply  # noqa: E402
+
+
+def _cut():
+    return Reply("<think>Пользователь спрашивает про ставку, нужно подумать", "length")
+
+
+def test_route_retries_with_bigger_limit_when_cut_by_length(kb):
+    client = FakeClient(reply=[_cut(), Reply(plan_json(scenario="illegal"), "stop")])
+    plan = route(client, kb, "вопрос", None)
+    assert plan is not None and plan.scenario == "illegal"
+    assert client.max_tokens == [2048, 4096] and client.calls["chat"] == 2
+
+
+def test_route_gives_up_after_one_retry(kb, capsys):
+    client = FakeClient(reply=[_cut(), _cut(), _cut()])
+    assert route(client, kb, "вопрос", None) is None
+    assert client.calls["chat"] == 2  # одна попытка и один повтор, не больше
+    assert "[router]" in capsys.readouterr().err
+
+
+def test_route_does_not_retry_a_finished_garbage_reply(kb):
+    client = FakeClient(reply=[Reply("не JSON", "stop"), Reply(plan_json(), "stop")])
+    assert route(client, kb, "вопрос", None) is None
+    assert client.calls["chat"] == 1
+
+
+def test_route_adds_no_think_when_flag_set(kb, monkeypatch):
+    monkeypatch.setenv("LLM_NO_THINK", "1")
+    client = FakeClient(reply=plan_json())
+    route(client, kb, "вопрос", None)
+    assert client.messages[0][-1]["content"].endswith(prompts.NO_THINK)
+    monkeypatch.delenv("LLM_NO_THINK")
+    client = FakeClient(reply=plan_json())
+    route(client, kb, "вопрос", None)
+    assert prompts.NO_THINK not in client.messages[0][-1]["content"]
+
+
+@pytest.mark.parametrize("question", [
+    "Что это за договор поставки П-17/2024?",
+    "Какой срок оплаты по договору с ООО «Северный Склад»?",
+    "Что сказано в договоре с Альфа-Трейдингом о качестве?",
+])
+def test_known_contract_or_company_is_never_not_in_kb(kb, question):
+    p = _route_q(kb, question, scenario="not_in_kb", docs=["contract_p-17-2024"])
+    assert p.scenario == "fact"
+
+
+def test_known_entity_with_claims_becomes_false_premise(kb):
+    p = _route_q(kb, "По договору П-17/2024 оплата за 30 дней, верно?",
+                 scenario="not_in_kb", claims=["оплата за 30 дней"])
+    assert p.scenario == "false_premise"
+
+
+def test_not_in_kb_stays_when_no_known_entity(kb):
+    assert _route_q(kb, "Сколько дней ежегодного оплачиваемого отпуска положено работнику?",
+                    scenario="not_in_kb").scenario == "not_in_kb"
+    assert _route_q(kb, "Какой срок оплаты по договору с ООО «Бета-Логистик»?",
+                    scenario="fact").scenario == "not_in_kb"  # неизвестная организация — по-прежнему not_in_kb
+
+
+@pytest.mark.parametrize("question", ["", "   ", "\n\t", "???", " . "])
+def test_empty_question_gets_polite_answer_without_any_call(kb, question):
+    client = _router_client(plan_json(scenario="illegal"))
+    res = _assistant(kb, client).answer(question, [])
+    assert res["status"] == "offtopic" and "Вопрос не получен" in res["answer"]
+    assert res["citations"] == [] and res["steps"] == []
+    assert res["debug"]["retrieved"] == [] and res["debug"]["plan"] is None
+    assert client.calls["chat"] == 0 and client.calls["rerank"] == 0
+
+
+def test_empty_question_asks_to_clarify_when_allowed(kb):
+    client = _router_client(plan_json())
+    res = _assistant(kb, client).answer("  ", [], allow_clarify=True)
+    assert res["status"] == "clarify" and client.calls["chat"] == 0
+
+
+def test_empty_last_turn_in_dialog_is_empty_question(kb):
+    client = _router_client(plan_json())
+    res = _assistant(kb, client).answer("Пользователь: ???")
+    assert res["status"] == "offtopic" and client.calls["chat"] == 0
+
+
+def test_short_real_question_is_not_blocked(kb, monkeypatch):
+    monkeypatch.setenv("ROUTER", "0")
+    client = _router_client(plan_json())
+    res = _assistant(kb, client).answer("НДС?", [])
+    assert client.calls["chat"] == 1 and "Вопрос не получен" not in res["answer"]

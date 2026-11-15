@@ -54,3 +54,21 @@ python eval/judge.py --name v1                 # полный прогон: аг
 - Фильтры: `--ids demo-5 own-3`, `--scenario false_premise`, `--source demo|own`.
 - Судья: `JUDGE_MODEL` (по умолчанию `qwen3:8b`), `JUDGE_BASE_URL` / `JUDGE_API_KEY` (по умолчанию как у агента), `JUDGE_MAX_TOKENS` (8192: qwen3:8b с 4096 иногда не успевает дорассуждать), `JUDGE_TIMEOUT` (600 с). На локальной Ollama генератор и эмбеддер выгружаются перед фазой судьи. Baseline запускается пачками по 10 вопросов без настроек агента из `.env` (`TOP_K` и т. п.), с лимитом `BASELINE_MAX_TOKENS` (по умолчанию 4096: с 1024 локальная qwen3 не успевает ответить).
 - Ограничение: наш судья не совпадает с судьей платформы.
+
+# Legal RAG Assistant — API
+
+HTTP-бекенд юридического ассистента: FastAPI поверх `core/` (RAG по нормативной базе знаний).
+
+
+## Запуск
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env          # заполнить LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
+uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+
+Сервис: http://localhost:8000 
+Swagger: http://localhost:8000/docs
+
+При старте загружается база знаний из DATA_DIR/knowledge-base.zip (или KB_PATH).
+Пока идёт загрузка, /health отдаёт 503, после — 200.
