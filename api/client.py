@@ -18,9 +18,17 @@ from urllib.parse import quote
 
 import httpx
 
-# Должен быть БОЛЬШЕ серверного CHAT_TIMEOUT (180 с), иначе клиент оборвёт
-# соединение раньше, чем сервер успеет вернуть осмысленный 504.
-DEFAULT_TIMEOUT = API_URL = float(os.getenv("LLM_TIMEOUT", 300.0)) + 10.0
+def _env_float(name: str, default: float) -> float:
+    """float из окружения; пустое или битое значение (например `CHAT_TIMEOUT=` в .env) -> default, а не падение при импорте."""
+    try:
+        return float(os.getenv(name) or default)
+    except ValueError:
+        return default
+
+
+# Должен быть БОЛЬШЕ серверного CHAT_TIMEOUT (по умолчанию 180 с): сервер сам обрывает запрос на CHAT_TIMEOUT
+# и отвечает 504; клиент, ждущий меньше, увидел бы вместо него «нет связи».
+DEFAULT_TIMEOUT = _env_float("CHAT_TIMEOUT", 180.0) + 30.0
 
 
 class LegalAssistantError(RuntimeError):
@@ -43,7 +51,8 @@ class LegalAssistantClient:
         self.base = (base_url or os.getenv("API_URL", "http://localhost:8000")).rstrip("/")
         self.timeout = timeout
         # один Client = переиспользование соединений; потокобезопасен
-        self._http = httpx.Client(timeout=timeout)
+        # connect=5: если хост недоступен, «нет связи» появляется за секунды, а не через весь read-таймаут
+        self._http = httpx.Client(timeout=httpx.Timeout(timeout, connect=5.0))
 
     def close(self) -> None:
         self._http.close()
