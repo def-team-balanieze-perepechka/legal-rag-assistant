@@ -16,6 +16,7 @@ DOC_TYPE_TITLES = {
 def _reset_dialog() -> None:
     st.session_state.messages = []
     st.session_state.pending = False
+    st.session_state.job = None
     st.session_state.last_error = None
     st.session_state.selected_msg = None
 
@@ -29,11 +30,6 @@ def render_sidebar() -> None:
             on_click=_reset_dialog,
             disabled=not st.session_state.messages,
             help="Очищает историю: она уходит в API как контекст и влияет на поиск",
-        )
-        st.toggle(
-            "Уточняющие вопросы",
-            key="allow_clarify",
-            help="Если из вопроса неясно, о каком договоре/периоде речь, ассистент уточнит перед ответом",
         )
         st.divider()
 
