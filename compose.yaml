@@ -42,6 +42,7 @@ services:
     ports:
       - "127.0.0.1:8001:8000"   # только с этой машины: у API нет авторизации, а за ним платный LLM-ключ
     environment:
+      DATA_DIR: /data   # перекрывает DATA_DIR=data из .env: том с базой знаний смонтирован в /data
       CHAT_TIMEOUT: ${CHAT_TIMEOUT:-270}   # сервер обрывает запрос на этом значении; клиент UI ждёт на 30 с дольше
     volumes:
       - ./data:/data:ro
